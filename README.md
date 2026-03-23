@@ -4,7 +4,7 @@ A C program that decompresses H.265/HEVC encoded HD video using FFmpeg's
 `libavcodec` decoder. Reads any container (`.mp4`, `.mkv`, `.hevc`, `.ts`, ...)
 and writes raw YUV420p frames to disk.
 
-## How it works, test
+## How it works
 
 ```
 Input file
