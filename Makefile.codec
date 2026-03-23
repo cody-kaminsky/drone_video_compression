@@ -1,0 +1,79 @@
+# Makefile for the custom drone codec
+#
+# Build everything:   make -f Makefile.codec
+# Run tests:          make -f Makefile.codec test
+# Run with real YUV:  make -f Makefile.codec test_yuv YUV=video.yuv W=1920 H=1080
+# Clean:              make -f Makefile.codec clean
+
+CC     := gcc
+CFLAGS := -O2 -Wall -Wextra -std=c11 -Wno-unused-parameter -I.
+LFLAGS := -lm
+
+# ---- Codec library sources ----
+CODEC_SRCS := \
+    codec/bitstream.c \
+    codec/dct.c       \
+    codec/quant.c     \
+    codec/predict.c   \
+    codec/encoder.c   \
+    codec/decoder.c   \
+    codec/deblock.c
+
+CODEC_OBJS := $(CODEC_SRCS:.c=.o)
+
+# ---- Hardware-pipeline sources (VHDL-friendly C model) ----
+HW_SRCS := \
+    codec/hw/dct_hw.c   \
+    codec/hw/quant_hw.c \
+    codec/hw/deblock_hw.c
+
+HW_OBJS := $(HW_SRCS:.c=.o)
+
+# ---- Targets ----
+.PHONY: all test test_yuv clean
+
+all: test/test_dct test/test_codec test/test_hw tools/encode tools/decode
+
+# Unit tests
+test/test_dct: test/test_dct.c $(CODEC_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LFLAGS)
+
+test/test_codec: test/test_codec.c $(CODEC_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LFLAGS)
+
+test/test_hw: test/test_hw.c $(CODEC_OBJS) $(HW_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LFLAGS)
+
+# CLI tools
+tools/encode: tools/encode.c $(CODEC_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LFLAGS)
+
+tools/decode: tools/decode.c $(CODEC_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LFLAGS)
+
+# Compile codec objects
+%.o: %.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+# Run all tests
+test: test/test_dct test/test_codec test/test_hw
+	@echo ""
+	@echo "=== Running test_dct ==="
+	./test/test_dct
+	@echo ""
+	@echo "=== Running test_codec ==="
+	./test/test_codec
+	@echo ""
+	@echo "=== Running test_hw (hardware pipeline) ==="
+	./test/test_hw
+
+# Run codec test with a real YUV file
+# Usage: make -f Makefile.codec test_yuv YUV=video.yuv W=1920 H=1080
+test_yuv: test/test_codec
+	./test/test_codec $(YUV) $(W) $(H)
+
+clean:
+	rm -f $(CODEC_OBJS) $(HW_OBJS)
+	rm -f test/test_dct test/test_codec test/test_hw
+	rm -f tools/encode tools/decode
+	rm -f *.drn *.yuv

@@ -1,0 +1,162 @@
+-- =============================================================================
+-- quant_enc.vhd  --  Forward quantiser (division-free, one coefficient/clock)
+--
+-- Translates quant_hw.c (quant_hw_tick) to synthesisable VHDL.
+--
+-- Operation
+-- ---------
+--   output = sign(in) * max(0, floor(|in| * recip >> 16) )  if |in| >= dead_zone
+--   output = 0                                               otherwise
+--
+--   recip = (2^16) / step  — preloaded from the QP ROM on QP change
+--
+-- Interface
+-- ---------
+--   Input  : one DCT coefficient per clock (signed 32-bit)
+--   Output : one quantised coefficient per clock (signed 16-bit), 1-cycle latency
+--
+-- Resource estimate
+-- -----------------
+--   DSP58E2 : 1  (|in| × recip → 48-bit, then logical right-shift by 16)
+--   LUT     : ~20 (dead-zone compare + sign mux)
+--   Latency : 1 clock cycle
+-- =============================================================================
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+use work.enc_pkg.all;
+
+entity quant_enc is
+  port (
+    aclk      : in  std_logic;
+    aresetn   : in  std_logic;
+
+    -- QP configuration — update between frames (latency 1 cycle)
+    qp        : in  unsigned(5 downto 0);   -- 1..51
+    is_intra  : in  std_logic;              -- '1' = I-frame (larger dead-zone)
+
+    -- Input: one coefficient from DCT pipeline
+    s_tdata   : in  std_logic_vector(31 downto 0);  -- signed 32-bit
+    s_tvalid  : in  std_logic;
+    s_tready  : out std_logic;  -- always '1' (1-cycle combinatorial)
+
+    -- Output: quantised coefficient, 1-cycle delayed
+    m_tdata   : out std_logic_vector(15 downto 0);  -- signed 16-bit
+    m_tvalid  : out std_logic
+  );
+end entity quant_enc;
+
+architecture rtl of quant_enc is
+
+  -- -------------------------------------------------------------------------
+  -- QP step ROM: 51 entries, step = BASE[qp%6] << (qp/6)
+  -- BASE = {10,11,13,14,16,18}
+  -- -------------------------------------------------------------------------
+  type step_rom_t is array(1 to 51) of integer range 0 to 65535;
+
+  type int6_arr_t is array(0 to 5) of integer;
+  function build_step_rom return step_rom_t is
+    constant BASE : int6_arr_t := (10, 11, 13, 14, 16, 18);
+    variable rom  : step_rom_t;
+  begin
+    for q in 1 to 51 loop
+      rom(q) := BASE((q-1) mod 6) * (2 ** ((q-1)/6));
+    end loop;
+    return rom;
+  end function;
+
+  -- Precomputed reciprocals: RECIP_ROM(q) = floor(2^16 / STEP_ROM(q))
+  -- Eliminates runtime division, replacing the 32-CARRY8 critical path with a ROM lookup.
+  function build_recip_rom return step_rom_t is
+    constant BASE : int6_arr_t := (10, 11, 13, 14, 16, 18);
+    variable rom  : step_rom_t;
+    variable step : integer;
+  begin
+    for q in 1 to 51 loop
+      step   := BASE((q-1) mod 6) * (2 ** ((q-1)/6));
+      rom(q) := 65536 / step;
+    end loop;
+    return rom;
+  end function;
+
+  constant STEP_ROM  : step_rom_t := build_step_rom;
+  constant RECIP_ROM : step_rom_t := build_recip_rom;
+
+  -- Pre-computed per-QP values loaded into registers when QP changes
+  signal step_r    : integer range 1 to 65535 := 10;
+  signal recip_r   : unsigned(15 downto 0)    := x"1999";  -- 2^16 / 10
+  signal dz_intra  : integer range 0 to 32767 := 4;        -- step*3/8
+  signal dz_inter  : integer range 0 to 32767 := 5;        -- step/2
+
+  -- Pipeline register
+  signal qp_prev   : unsigned(5 downto 0) := (others => '0');
+
+begin
+
+  s_tready <= '1';  -- always ready (1-cycle latency, no backpressure)
+
+  -- -------------------------------------------------------------------------
+  -- Register process
+  -- -------------------------------------------------------------------------
+  process(aclk)
+    variable coeff   : signed(31 downto 0);
+    variable av      : unsigned(31 downto 0);
+    variable product : unsigned(47 downto 0);
+    variable q_val   : integer;
+    variable out_val : signed(15 downto 0);
+    variable qp_int  : integer range 1 to 51;
+    variable dz_sel  : integer;
+    variable s       : integer range 0 to 65535;
+  begin
+    if rising_edge(aclk) then
+      if aresetn = '0' then
+        m_tdata   <= (others => '0');
+        m_tvalid  <= '0';
+        step_r    <= 10;
+        recip_r   <= x"1999";
+        dz_intra  <= 4;
+        dz_inter  <= 5;
+        qp_prev   <= (others => '0');
+      else
+        -- Update step ROM lookup when QP changes
+        if qp /= qp_prev then
+          qp_int   := to_integer(qp);
+          if qp_int < 1  then qp_int := 1;  end if;
+          if qp_int > 51 then qp_int := 51; end if;
+          s        := STEP_ROM(qp_int);
+          step_r   <= s;
+          recip_r  <= to_unsigned(RECIP_ROM(qp_int), 16);
+          dz_intra <= (s * 3) / 8;
+          dz_inter <= s / 2;
+          qp_prev  <= qp;
+        end if;
+
+        -- Quantise one coefficient
+        m_tvalid <= s_tvalid;
+        if s_tvalid = '1' then
+          coeff   := signed(s_tdata);
+          av      := unsigned(abs(coeff));
+          product := av * recip_r;   -- 32×16 → 48-bit
+          q_val   := to_integer(product(47 downto 16));  -- >> 16
+
+          if is_intra = '1' then
+            dz_sel := dz_intra;
+          else
+            dz_sel := dz_inter;
+          end if;
+
+          if to_integer(av) < dz_sel or q_val = 0 then
+            out_val := (others => '0');
+          elsif coeff >= 0 then
+            out_val := to_signed(q_val, 16);
+          else
+            out_val := to_signed(-q_val, 16);
+          end if;
+
+          m_tdata <= std_logic_vector(out_val);
+        end if;
+      end if;
+    end if;
+  end process;
+
+end architecture rtl;
