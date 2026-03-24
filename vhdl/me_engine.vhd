@@ -221,8 +221,8 @@ architecture rtl of me_engine is
     variable s    : unsigned(11 downto 0) := (others => '0');
     variable p00, p01, p10, p11 : unsigned(7 downto 0);
     variable interp : unsigned(7 downto 0);
-    variable sum2   : unsigned(9 downto 0);
-    variable sum4   : unsigned(10 downto 0);
+    variable sum2   : unsigned(8 downto 0);   -- 2x 8-bit + 1 = max 511, 9 bits
+    variable sum4   : unsigned(9 downto 0);   -- 4x 8-bit + 2 = max 1022, 10 bits
   begin
     for i in 0 to 7 loop
       p00 := unsigned(pick_byte(w00, w01, x_off, i));
@@ -249,7 +249,7 @@ architecture rtl of me_engine is
         sum2   := ('0' & p00) + ('0' & p10) + 1;
         interp := sum2(8 downto 1);
       elsif xf = '1' and yf = '1' then
-        sum4   := ('0' & p00) + ('0' & p01) + ('0' & p10) + ('0' & p11) + 2;
+        sum4   := ("00" & p00) + ("00" & p01) + ("00" & p10) + ("00" & p11) + 2;
         interp := sum4(9 downto 2);
       else
         interp := p00;
@@ -410,8 +410,8 @@ begin
               if search_stride = 1 then
                 -- Integer search done; start half-pixel
                 hp_idx  <= 0;
-                hp_mv_dx <= resize(best_mv_dx, 7) * 2;  -- convert to half-pel units
-                hp_mv_dy <= resize(best_mv_dy, 7) * 2;
+                hp_mv_dx <= best_mv_dx & '0';  -- convert to half-pel units (x2)
+                hp_mv_dy <= best_mv_dy & '0';
                 state    <= HALFPEL_INIT;
               else
                 -- Reduce stride

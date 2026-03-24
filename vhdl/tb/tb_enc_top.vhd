@@ -45,9 +45,9 @@ use work.enc_pkg.all;
 
 entity tb_enc_top is
   generic (
-    FRAME_W  : integer := 256;         -- must be multiple of 8
-    FRAME_H  : integer := 192;         -- must be multiple of 8
-    G_QP     : integer := 16;          -- quantisation parameter
+    FRAME_W  : integer := 1024;         -- must be multiple of 8
+    FRAME_H  : integer := 768;         -- must be multiple of 8
+    G_QP     : integer := 28;          -- quantisation parameter
     G_GOP    : integer := 1;           -- 1 = all I-frames
     YUV_FILE : string  := "";          -- raw YUV 4:2:0 file; "" = synthetic
     BS_FILE  : string  := "bs_out.bin" -- output bitstream file

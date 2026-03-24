@@ -76,14 +76,21 @@ architecture rtl of mb_buffer is
   -- BRAM: 48 rows × ROW_STRIDE words, 64 bits
   -- =========================================================================
   constant ROW_STRIDE : integer := 512;
-  constant LB_DEPTH   : integer := 48 * ROW_STRIDE;
+  constant LB_DEPTH   : integer := 16 * ROW_STRIDE;  -- per plane (bank A + bank B = 16 rows)
 
+  -- Split into three separate BRAMs so each has a single write port,
+  -- allowing Vivado to infer block RAM cleanly.
   type lb_t is array(0 to LB_DEPTH-1) of std_logic_vector(63 downto 0);
-  signal lb : lb_t;
-  attribute ram_style       : string;
-  attribute ram_style of lb : signal is "block";
+  signal lb_y  : lb_t;
+  signal lb_cb : lb_t;
+  signal lb_cr : lb_t;
+  attribute ram_style          : string;
+  attribute ram_style of lb_y  : signal is "block";
+  attribute ram_style of lb_cb : signal is "block";
+  attribute ram_style of lb_cr : signal is "block";
 
-  function lb_addr(row : integer range 0 to 47;
+  -- Row is now 0-15 within each plane's array (bank A = rows 0-7, bank B = rows 8-15)
+  function lb_addr(row : integer range 0 to 15;
                    col : integer range 0 to ROW_STRIDE-1) return integer is
   begin
     return row * ROW_STRIDE + col;
@@ -221,20 +228,22 @@ begin
   -- BRAM synchronous read (1-cycle latency) – bank selected per FSM state
   -- =========================================================================
   process(aclk)
-    variable rd_bank : integer range 0 to 40;
+    variable rd_row : integer range 0 to 15;
   begin
     if rising_edge(aclk) then
       if use_chroma_rd = '0' then
         -- Luma: bank A (rows 0-7) or bank B (rows 8-15)
-        if rd_strip_sel = '1' then rd_bank := 8; else rd_bank := 0; end if;
+        if rd_strip_sel = '1' then rd_row := 8; else rd_row := 0; end if;
+        rd_data <= lb_y(lb_addr(rd_row + rd_fetch_row, rd_waddr));
       elsif plane_sel = "01" then
-        -- Cb: bank A (rows 16-23) or bank B (rows 24-31)
-        if cb_rd_strip_sel = '1' then rd_bank := 24; else rd_bank := 16; end if;
+        -- Cb: bank A (rows 0-7) or bank B (rows 8-15) of lb_cb
+        if cb_rd_strip_sel = '1' then rd_row := 8; else rd_row := 0; end if;
+        rd_data <= lb_cb(lb_addr(rd_row + rd_fetch_row, rd_waddr));
       else
-        -- Cr: bank A (rows 32-39) or bank B (rows 40-47)
-        if cr_rd_strip_sel = '1' then rd_bank := 40; else rd_bank := 32; end if;
+        -- Cr: bank A (rows 0-7) or bank B (rows 8-15) of lb_cr
+        if cr_rd_strip_sel = '1' then rd_row := 8; else rd_row := 0; end if;
+        rd_data <= lb_cr(lb_addr(rd_row + rd_fetch_row, rd_waddr));
       end if;
-      rd_data <= lb(lb_addr(rd_bank + rd_fetch_row, rd_waddr));
     end if;
   end process;
 
@@ -294,9 +303,9 @@ begin
             buf(wr_phase*8+7 downto wr_phase*8) := s_tdata;
             if wr_phase = 7 then
               if wr_strip_sel = '1' then
-                lb(lb_addr(8 + wr_row, wr_waddr)) <= buf;
+                lb_y(lb_addr(8 + wr_row, wr_waddr)) <= buf;
               else
-                lb(lb_addr(wr_row, wr_waddr)) <= buf;
+                lb_y(lb_addr(wr_row, wr_waddr)) <= buf;
               end if;
               wr_phase <= 0;
               if wr_waddr < ROW_STRIDE - 1 then
@@ -355,9 +364,9 @@ begin
               buf(cb_wr_phase*8+7 downto cb_wr_phase*8) := s_tdata;
               if cb_wr_phase = 7 then
                 if cb_wr_strip_sel = '1' then
-                  lb(lb_addr(24 + cb_wr_row, cb_wr_waddr)) <= buf;
+                  lb_cb(lb_addr(8 + cb_wr_row, cb_wr_waddr)) <= buf;
                 else
-                  lb(lb_addr(16 + cb_wr_row, cb_wr_waddr)) <= buf;
+                  lb_cb(lb_addr(cb_wr_row, cb_wr_waddr)) <= buf;
                 end if;
                 cb_wr_phase <= 0;
                 if cb_wr_waddr < ROW_STRIDE - 1 then
@@ -395,9 +404,9 @@ begin
               buf(cr_wr_phase*8+7 downto cr_wr_phase*8) := s_tdata;
               if cr_wr_phase = 7 then
                 if cr_wr_strip_sel = '1' then
-                  lb(lb_addr(40 + cr_wr_row, cr_wr_waddr)) <= buf;
+                  lb_cr(lb_addr(8 + cr_wr_row, cr_wr_waddr)) <= buf;
                 else
-                  lb(lb_addr(32 + cr_wr_row, cr_wr_waddr)) <= buf;
+                  lb_cr(lb_addr(cr_wr_row, cr_wr_waddr)) <= buf;
                 end if;
                 cr_wr_phase <= 0;
                 if cr_wr_waddr < ROW_STRIDE - 1 then
