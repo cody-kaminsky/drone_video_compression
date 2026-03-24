@@ -477,7 +477,53 @@ def main():
                        for r2 in range(8) for c2 in range(8)) / 64
         blk_errors.append((bx, by, mse_blk))
 
-    print()
+    print(f"\n  Bits consumed after luma: {bs.total_bits}  "
+          f"(of {len(raw)*8} total = {len(raw)} bytes)\n")
+
+    # --- Chroma blocks ---
+    cW = W // 2;  cH = H // 2
+    chr_blk_cols = cW // 8;  chr_blk_rows = cH // 8
+    n_chr = chr_blk_cols * chr_blk_rows
+
+    print(f"=== CHROMA BLOCKS (Cb then Cr, {n_chr} each, always INTRA_DC pred=128) ===")
+
+    for plane in ('Cb', 'Cr'):
+        prev_dc_chr = 0
+        nonzero_blks = 0
+        dc_sum = 0
+        for blk_idx in range(n_chr):
+            bits_before = bs.total_bits
+            mode_bits = bs.read_bits(2)
+            count = bs.read_ue()
+            coeffs_flat = [0]*64
+            if count > 0:
+                dc_diff = bs.read_se()
+                dc_quant = dc_diff + prev_dc_chr
+                prev_dc_chr = dc_quant
+                coeffs_flat[0] = dc_quant
+                for i in range(1, count):
+                    coeffs_flat[i] = bs.read_se()
+            else:
+                prev_dc_chr = 0
+
+            nz = sum(1 for v in coeffs_flat if v != 0)
+            if nz > 0:
+                nonzero_blks += 1
+            dc_sum += coeffs_flat[0]
+
+            bx = blk_idx % chr_blk_cols
+            by = blk_idx // chr_blk_cols
+            if blk_idx < 4 or nz > 0:  # show first 4 + any nonzero
+                print(f"  {plane} blk({bx},{by}): mode={mode_bits}  "
+                      f"count={count:2d}  DC={coeffs_flat[0]:4d}  "
+                      f"nz_coeffs={nz}  bits_used={bs.total_bits - bits_before}")
+
+        print(f"  {plane}: {nonzero_blks}/{n_chr} blocks have non-zero coeffs  "
+              f"avg_DC={dc_sum/n_chr:.1f}\n")
+
+    bits_remaining = len(raw)*8 - bs.total_bits
+    print(f"Bits remaining after chroma: {bits_remaining}  "
+          f"(byte_pos={bs.byte_pos}/{len(raw)})\n")
 
     # --- PSNR ---
     total_mse = sum(m for _,_,m in blk_errors) / len(blk_errors)

@@ -288,7 +288,6 @@ architecture rtl of enc_top is
   signal enc_irq_s     : std_logic;
   signal frame_cnt     : unsigned(31 downto 0) := (others => '0');
   signal bs_byte_cnt   : unsigned(31 downto 0) := (others => '0');
-  signal block_cnt     : integer range 0 to 32767 := 0;
   signal flush_d1      : std_logic := '0';
   signal flush_d2      : std_logic := '0';
   -- Count skip blocks (they don't produce zigzag tlast)
@@ -307,11 +306,30 @@ architecture rtl of enc_top is
   signal inject_mv     : std_logic := '0';
   signal mv_se_val     : std_logic_vector(15 downto 0);
 
+  -- -------------------------------------------------------------------------
+  -- Encoding phase state machine (luma → Cb → Cr)
+  -- -------------------------------------------------------------------------
+  type enc_phase_t is (PHASE_LUMA, PHASE_WAIT_CB, PHASE_CB,
+                       PHASE_WAIT_CR, PHASE_CR);
+  signal enc_phase       : enc_phase_t := PHASE_LUMA;
+
+  -- mb_buffer plane-select and chroma control
+  signal mb_plane_sel    : std_logic_vector(1 downto 0) := "00";
+  signal mb_cb_strip_rdy : std_logic;   -- cb_strip_rdy_out from mb_buffer
+  signal mb_cr_strip_rdy : std_logic;   -- cr_strip_rdy_out from mb_buffer
+  signal is_chroma_phase : std_logic;   -- '1' when enc_phase /= PHASE_LUMA
+
+  -- Per-plane block counters
+  signal luma_blk_cnt : integer range 0 to 32767 := 0;
+  signal cb_blk_cnt   : integer range 0 to 8191  := 0;
+  signal cr_blk_cnt   : integer range 0 to 8191  := 0;
+
 begin
 
-  int_resetn   <= aresetn and not enc_reset;
-  irq          <= enc_irq_s;
-  frame_sof    <= s_axis_video_tuser and s_axis_video_tvalid;
+  int_resetn     <= aresetn and not enc_reset;
+  irq            <= enc_irq_s;
+  frame_sof      <= s_axis_video_tuser and s_axis_video_tvalid;
+  is_chroma_phase <= '1' when enc_phase /= PHASE_LUMA else '0';
 
   -- =========================================================================
   -- AXI-Lite control registers
@@ -373,32 +391,38 @@ begin
   -- =========================================================================
   u_mb : entity work.mb_buffer
     port map (
-      aclk           => aclk,
-      aresetn        => int_resetn,
-      frame_width    => enc_width,
-      frame_height   => enc_height,
-      enc_enable     => enc_enable,
-      frame_type     => frame_type,
-      s_tdata        => s_axis_video_tdata,
-      s_tvalid       => s_axis_video_tvalid,
-      s_tready       => s_axis_video_tready,
-      s_tlast        => s_axis_video_tlast,
-      s_tuser        => s_axis_video_tuser,
-      m_tdata        => mb_dct_tdata,
-      m_tvalid       => mb_dct_tvalid,
-      m_tready       => mb_dct_tready,
-      m_pred_dc      => mb_pred_dc,
-      m_pred_valid   => mb_pred_valid,
-      m_intra_mode   => mb_intra_mode,
-      m_above_row    => mb_above_row,
-      m_left_col     => mb_left_col,
-      strip_rdy_out  => mb_strip_rdy,
-      mb_blk_start   => mb_blk_start,
-      mb_blk_x       => mb_blk_x,
-      mb_blk_y       => mb_blk_y,
-      recon_done     => rw_recon_done,
-      recon_row7     => rw_row7,
-      recon_col7     => rw_col7
+      aclk             => aclk,
+      aresetn          => int_resetn,
+      frame_width      => enc_width,
+      frame_height     => enc_height,
+      enc_enable       => enc_enable,
+      frame_type       => frame_type,
+      plane_sel        => mb_plane_sel,
+      chroma_width     => '0' & enc_width(11 downto 1),
+      chroma_height    => '0' & enc_height(11 downto 1),
+      chroma_plane_rst => '0',
+      s_tdata          => s_axis_video_tdata,
+      s_tvalid         => s_axis_video_tvalid,
+      s_tready         => s_axis_video_tready,
+      s_tlast          => s_axis_video_tlast,
+      s_tuser          => s_axis_video_tuser,
+      m_tdata          => mb_dct_tdata,
+      m_tvalid         => mb_dct_tvalid,
+      m_tready         => mb_dct_tready,
+      m_pred_dc        => mb_pred_dc,
+      m_pred_valid     => mb_pred_valid,
+      m_intra_mode     => mb_intra_mode,
+      m_above_row      => mb_above_row,
+      m_left_col       => mb_left_col,
+      strip_rdy_out    => mb_strip_rdy,
+      cb_strip_rdy_out => mb_cb_strip_rdy,
+      cr_strip_rdy_out => mb_cr_strip_rdy,
+      mb_blk_start     => mb_blk_start,
+      mb_blk_x         => mb_blk_x,
+      mb_blk_y         => mb_blk_y,
+      recon_done       => rw_recon_done,
+      recon_row7       => rw_row7,
+      recon_col7       => rw_col7
     );
 
   -- =========================================================================
@@ -501,12 +525,12 @@ begin
       aclk        => aclk,
       aresetn     => int_resetn,
       qp          => enc_qp,
-      is_intra    => not frame_type,
+      is_intra    => (not frame_type) or is_chroma_phase,
       coeff_in    => rw_coeff,
       coeff_valid => rw_coeff_v,
       blk_start   => rw_blk_start,
       pred_dc        => mb_pred_dc,
-      pred_use_dc    => not frame_type,
+      pred_use_dc    => (not frame_type) or is_chroma_phase,
       pred_above_row => mb_above_row,
       pred_left_col  => mb_left_col,
       intra_mode     => mb_intra_mode,
@@ -544,10 +568,15 @@ begin
       m_tready  => dct_q_tready
     );
 
-  -- DCT input mux: I-frame → mb_buffer directly; P-frame → computed residuals
-  dct_in_data  <= mb_dct_tdata  when frame_type = FRAME_I else p_res_row;
-  dct_in_valid <= mb_dct_tvalid when frame_type = FRAME_I else p_res_valid;
-  mb_dct_tready <= dct_in_ready when frame_type = FRAME_I else '0';
+  -- DCT input mux:
+  --   I-frame luma or any chroma phase → mb_buffer residuals
+  --   P-frame luma                     → computed residuals (p_res_row)
+  dct_in_data  <= mb_dct_tdata  when (frame_type = FRAME_I or is_chroma_phase = '1')
+                                else p_res_row;
+  dct_in_valid <= mb_dct_tvalid when (frame_type = FRAME_I or is_chroma_phase = '1')
+                                else p_res_valid;
+  mb_dct_tready <= dct_in_ready when (frame_type = FRAME_I or is_chroma_phase = '1')
+                                else '0';
 
   -- tready is asserted in SER_CAPTURE so that the row is latched in the
   -- same cycle the handshake occurs — not one cycle before (SER_REQUEST),
@@ -609,7 +638,8 @@ begin
   process(aclk)
   begin
     if rising_edge(aclk) then
-      if int_resetn = '0' or frame_start = '1' then
+      if int_resetn = '0' or frame_start = '1' or
+       enc_phase = PHASE_WAIT_CB or enc_phase = PHASE_WAIT_CR then
         prev_dc_q <= (others => '0');
         await_dc  <= '0';
       elsif zz_eg_tvalid = '1' and zz_eg_tready = '1' then
@@ -914,15 +944,22 @@ begin
   -- =========================================================================
 
   -- =========================================================================
-  -- Frame-done detector + IRQ + byte counter
-  -- Counts zz_eg_tlast pulses (residual blocks) + skip_block_cnt
+  -- Frame-done detector + IRQ + byte counter + encoding phase FSM
+  -- All in one process to avoid multiple-driver conflicts on frame_done / flush.
+  -- Phase order: LUMA → WAIT_CB → CB → WAIT_CR → CR → (LUMA next frame).
+  -- frame_done fires after the last Cr block is fully encoded.
   -- =========================================================================
   process(aclk)
-    variable n_blocks : integer range 1 to 32400;
+    variable n_luma   : integer range 1 to 32400;
+    variable n_chroma : integer range 1 to 16384;
   begin
     if rising_edge(aclk) then
       if int_resetn = '0' then
-        block_cnt      <= 0;
+        enc_phase      <= PHASE_LUMA;
+        mb_plane_sel   <= "00";
+        luma_blk_cnt   <= 0;
+        cb_blk_cnt     <= 0;
+        cr_blk_cnt     <= 0;
         skip_block_cnt <= 0;
         frame_done     <= '0';
         frame_cnt      <= (others => '0');
@@ -931,39 +968,81 @@ begin
         flush_d2       <= '0';
         bs_flush       <= '0';
       else
-        frame_done <= '0';
-        bs_flush   <= flush_d2;
-        flush_d2   <= flush_d1;
-        flush_d1   <= '0';
+        frame_done    <= '0';
+        bs_flush      <= flush_d2;
+        flush_d2      <= flush_d1;
+        flush_d1      <= '0';
+
+        -- Reset phase at start of new frame
+        if frame_start = '1' then
+          enc_phase    <= PHASE_LUMA;
+          mb_plane_sel <= "00";
+        end if;
 
         if m_axis_bitstream_tvalid = '1' and m_axis_bitstream_tready = '1' then
           bs_byte_cnt <= bs_byte_cnt + 1;
         end if;
 
-        n_blocks := to_integer(enc_width(11 downto 3)) *
+        n_luma   := to_integer(enc_width(11 downto 3)) *
                     to_integer(enc_height(11 downto 3));
+        -- Chroma: (W/2)/8 × (H/2)/8 = W/16 × H/16
+        n_chroma := to_integer(enc_width(11 downto 4)) *
+                    to_integer(enc_height(11 downto 4));
 
-        -- Count completed residual blocks (from zigzag tlast)
+        -- Steady-state phase output (overridden by transitions below)
+        case enc_phase is
+          when PHASE_WAIT_CB =>
+            -- One dead cycle: advance to CB
+            enc_phase    <= PHASE_CB;
+            mb_plane_sel <= "01";
+          when PHASE_WAIT_CR =>
+            enc_phase    <= PHASE_CR;
+            mb_plane_sel <= "10";
+          when others => null;
+        end case;
+
+        -- Count completed residual blocks (zigzag tlast) and trigger transitions
         if zz_eg_tvalid = '1' and zz_eg_tlast = '1' then
-          if block_cnt + skip_block_cnt + 1 = n_blocks then
-            block_cnt      <= 0;
-            skip_block_cnt <= 0;
-            frame_done     <= '1';
-            frame_cnt      <= frame_cnt + 1;
-            flush_d1       <= '1';
-          else
-            block_cnt <= block_cnt + 1;
-          end if;
+          case enc_phase is
+            when PHASE_LUMA =>
+              if luma_blk_cnt + skip_block_cnt + 1 = n_luma then
+                luma_blk_cnt   <= 0;
+                skip_block_cnt <= 0;
+                enc_phase      <= PHASE_WAIT_CB;
+                mb_plane_sel   <= "01";
+              else
+                luma_blk_cnt <= luma_blk_cnt + 1;
+              end if;
+            when PHASE_CB =>
+              if cb_blk_cnt + 1 = n_chroma then
+                cb_blk_cnt    <= 0;
+                enc_phase     <= PHASE_WAIT_CR;
+                mb_plane_sel  <= "10";
+              else
+                cb_blk_cnt <= cb_blk_cnt + 1;
+              end if;
+            when PHASE_CR =>
+              if cr_blk_cnt + 1 = n_chroma then
+                cr_blk_cnt   <= 0;
+                enc_phase    <= PHASE_LUMA;
+                mb_plane_sel <= "00";
+                frame_done   <= '1';
+                frame_cnt    <= frame_cnt + 1;
+                flush_d1     <= '1';
+              else
+                cr_blk_cnt <= cr_blk_cnt + 1;
+              end if;
+            when others => null;
+          end case;
         end if;
 
-        -- Count skip blocks (P-frame)
+        -- Skip blocks (P-frame luma only)
         if pblk_fsm = PBLK_SKIP_DONE then
-          if block_cnt + skip_block_cnt + 1 = n_blocks then
-            block_cnt      <= 0;
+          if luma_blk_cnt + skip_block_cnt + 1 = n_luma then
+            luma_blk_cnt   <= 0;
             skip_block_cnt <= 0;
-            frame_done     <= '1';
-            frame_cnt      <= frame_cnt + 1;
-            flush_d1       <= '1';
+            enc_phase      <= PHASE_WAIT_CB;
+            mb_plane_sel   <= "01";
           else
             skip_block_cnt <= skip_block_cnt + 1;
           end if;

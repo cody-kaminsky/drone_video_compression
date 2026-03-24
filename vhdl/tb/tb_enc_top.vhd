@@ -468,7 +468,7 @@ begin
                     vid_tready, pix, v_last, v_user);
     end loop;
 
-    -- --- Cb plane (W/2 × H/2) ---
+    -- --- Cb plane (W/2 × H/2): horizontal colour ramp ---
     total  := (FRAME_W / 2) * (FRAME_H / 2);
     line_w := FRAME_W / 2;
     for i in 0 to total - 1 loop
@@ -476,20 +476,22 @@ begin
         read(yuv_f, c);
         pix := character'pos(c);
       else
-        pix := 128;
+        -- Horizontal ramp: 100..227 across each chroma row (exercises AC coeffs)
+        pix := 100 + (i mod line_w) * 127 / (line_w - 1);
       end if;
       if (i mod line_w) = line_w - 1 then v_last := '1'; else v_last := '0'; end if;
       send_vid_byte(aclk, vid_tdata, vid_tvalid, vid_tlast, vid_tuser,
                     vid_tready, pix, v_last, '0');
     end loop;
 
-    -- --- Cr plane (W/2 × H/2) ---
+    -- --- Cr plane (W/2 × H/2): diagonal colour pattern ---
     for i in 0 to total - 1 loop
       if use_file and not endfile(yuv_f) then
         read(yuv_f, c);
         pix := character'pos(c);
       else
-        pix := 128;
+        -- Diagonal ramp: exercises both row-AC and col-AC in chroma DCT
+        pix := 80 + ((i / line_w) * 3 + (i mod line_w) * 5) mod 121;
       end if;
       if (i mod line_w) = line_w - 1 then v_last := '1'; else v_last := '0'; end if;
       send_vid_byte(aclk, vid_tdata, vid_tvalid, vid_tlast, vid_tuser,
@@ -581,9 +583,9 @@ begin
   -- -------------------------------------------------------------------------
   process
   begin
-    wait for 5 ms;
+    wait for 20 ms;  -- extended: chroma adds ~50% more blocks (3 planes)
     if not sim_done then
-      report "SIMULATION FAIL: watchdog timeout after 5 ms" severity failure;
+      report "SIMULATION FAIL: watchdog timeout after 20 ms" severity failure;
     end if;
     wait;
   end process;
