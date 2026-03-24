@@ -485,9 +485,15 @@ def main():
     chr_blk_cols = cW // 8;  chr_blk_rows = cH // 8
     n_chr = chr_blk_cols * chr_blk_rows
 
+    # Original synthetic chroma (matches tb_enc_top.vhd fallback pattern)
+    orig_cb = [[100 + col * 127 // (cW - 1) for col in range(cW)] for row in range(cH)]
+    orig_cr = [[80 + (row * 3 + col * 5) % 121 for col in range(cW)] for row in range(cH)]
+
     print(f"=== CHROMA BLOCKS (Cb then Cr, {n_chr} each, always INTRA_DC pred=128) ===")
 
-    for plane in ('Cb', 'Cr'):
+    chr_mse = {}
+    for plane, orig_plane in (('Cb', orig_cb), ('Cr', orig_cr)):
+        recon = [[128]*cW for _ in range(cH)]
         prev_dc_chr = 0
         nonzero_blks = 0
         dc_sum = 0
@@ -513,13 +519,30 @@ def main():
 
             bx = blk_idx % chr_blk_cols
             by = blk_idx // chr_blk_cols
+
+            # Reconstruct pixels: dequant + IDCT + pred(128)
+            qc = [[0]*8 for _ in range(8)]
+            for z in range(64):
+                nat = ZIGZAG_8x8[z]; r2 = nat >> 3; c2 = nat & 7
+                qc[r2][c2] = coeffs_flat[z]
+            dqc = [[qc[r2][c2] * step for c2 in range(8)] for r2 in range(8)]
+            res = idct8(dqc)
+            px = bx * 8;  py = by * 8
+            for r2 in range(8):
+                for c2 in range(8):
+                    recon[py+r2][px+c2] = max(0, min(255, res[r2][c2] + 128))
+
             if blk_idx < 4 or nz > 0:  # show first 4 + any nonzero
                 print(f"  {plane} blk({bx},{by}): mode={mode_bits}  "
                       f"count={count:2d}  DC={coeffs_flat[0]:4d}  "
                       f"nz_coeffs={nz}  bits_used={bs.total_bits - bits_before}")
 
+        mse = sum((recon[r][c] - orig_plane[r][c])**2
+                  for r in range(cH) for c in range(cW)) / (cW * cH)
+        psnr_chr = 10 * __import__('math').log10(255**2 / mse) if mse > 0 else float('inf')
+        chr_mse[plane] = mse
         print(f"  {plane}: {nonzero_blks}/{n_chr} blocks have non-zero coeffs  "
-              f"avg_DC={dc_sum/n_chr:.1f}\n")
+              f"avg_DC={dc_sum/n_chr:.1f}  MSE={mse:.1f}  PSNR={psnr_chr:.2f} dB\n")
 
     bits_remaining = len(raw)*8 - bs.total_bits
     print(f"Bits remaining after chroma: {bits_remaining}  "
@@ -591,8 +614,10 @@ def main():
     print(f"SW round-trip PSNR = {psnr_sw:.2f} dB  (MSE={mse_sw:.2f})")
     print()
     print("Conclusion:")
-    print(f"  SW round-trip PSNR = {psnr_sw:.2f} dB")
-    print(f"  HW PSNR            = {psnr:.2f} dB  (delta {psnr-psnr_sw:+.2f} dB)")
+    print(f"  SW round-trip PSNR (luma) = {psnr_sw:.2f} dB")
+    print(f"  HW luma  PSNR             = {psnr:.2f} dB  (delta {psnr-psnr_sw:+.2f} dB)")
+    print(f"  HW Cb    PSNR             = {10*__import__('math').log10(255**2/chr_mse['Cb']):.2f} dB  (MSE={chr_mse['Cb']:.1f})")
+    print(f"  HW Cr    PSNR             = {10*__import__('math').log10(255**2/chr_mse['Cr']):.2f} dB  (MSE={chr_mse['Cr']:.1f})")
 
 if __name__ == '__main__':
     main()

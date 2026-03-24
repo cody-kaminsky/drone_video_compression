@@ -239,29 +239,57 @@ begin
   end process;
 
   -- =========================================================================
-  -- Luma write: rows 0-7 (bank A) and 8-15 (bank B)
+  -- Combined BRAM write process (luma + chroma) — single driver for lb.
+  -- Having two separate processes both assigning to lb elements causes
+  -- multiple-driver resolution to 'U' in simulation even though they write
+  -- to disjoint address ranges.
   -- =========================================================================
   process(aclk)
     variable buf : std_logic_vector(63 downto 0);
   begin
     if rising_edge(aclk) then
       if aresetn = '0' or enc_enable = '0' then
-        wr_row <= 0;  wr_waddr <= 0;  wr_phase <= 0;
-        line_cnt    <= (others => '0');
-        y_active    <= '0';
-        strip_rdy   <= '0';
+        -- Luma write-side
+        wr_row       <= 0;  wr_waddr <= 0;  wr_phase <= 0;
+        line_cnt     <= (others => '0');
+        y_active     <= '0';
+        strip_rdy    <= '0';
         wr_strip_sel <= '0';
+        -- Chroma write-side
+        chr_active      <= '0';
+        chr_is_cr       <= '0';
+        chr_line_cnt    <= (others => '0');
+        cb_wr_row    <= 0;  cb_wr_waddr <= 0;  cb_wr_phase <= 0;
+        cr_wr_row    <= 0;  cr_wr_waddr <= 0;  cr_wr_phase <= 0;
+        cb_wr_strip_sel <= '0';
+        cr_wr_strip_sel <= '0';
+        cb_strip_rdy_r  <= '0';
+        cr_strip_rdy_r  <= '0';
       else
-        strip_rdy <= '0';
+        strip_rdy      <= '0';
+        cb_strip_rdy_r <= '0';
+        cr_strip_rdy_r <= '0';
 
-        if s_tvalid = '1' and y_active = '1' then
+        -- -----------------------------------------------------------------
+        -- Luma write: rows 0-7 (bank A) and 8-15 (bank B)
+        -- -----------------------------------------------------------------
+        if s_tvalid = '1' and (y_active = '1' or s_tuser = '1') then
 
           if s_tuser = '1' then
             wr_row   <= 0;  wr_waddr <= 0;  wr_phase <= 0;
             line_cnt <= (others => '0');
+            y_active <= '1';
+            -- Reset chroma write-side for new frame
+            chr_active      <= '0';
+            chr_is_cr       <= '0';
+            chr_line_cnt    <= (others => '0');
+            cb_wr_row    <= 0;  cb_wr_waddr <= 0;  cb_wr_phase <= 0;
+            cr_wr_row    <= 0;  cr_wr_waddr <= 0;  cr_wr_phase <= 0;
+            cb_wr_strip_sel <= '0';
+            cr_wr_strip_sel <= '0';
           end if;
 
-          if line_cnt < frame_height then
+          if s_tuser = '1' or line_cnt < frame_height then
             buf := wr_buf;
             buf(wr_phase*8+7 downto wr_phase*8) := s_tdata;
             if wr_phase = 7 then
@@ -300,70 +328,28 @@ begin
 
         end if;
 
-        -- Detect start of new frame
-        if s_tvalid = '1' and s_tuser = '1' then
-          y_active <= '1';
-          wr_row   <= 0;  wr_waddr <= 0;  wr_phase <= 0;
-          line_cnt <= (others => '0');
-        end if;
-
-      end if;
-    end if;
-  end process;
-
-  -- =========================================================================
-  -- Chroma write: auto-detect Cb/Cr bytes from y_active and chr_line_cnt.
-  -- Cb → rows 16-31, Cr → rows 32-47.  Independent of plane_sel.
-  -- =========================================================================
-  process(aclk)
-    variable buf : std_logic_vector(63 downto 0);
-  begin
-    if rising_edge(aclk) then
-      if aresetn = '0' or enc_enable = '0' then
-        chr_active     <= '0';
-        chr_is_cr      <= '0';
-        chr_line_cnt   <= (others => '0');
-        cb_wr_row    <= 0;  cb_wr_waddr <= 0;  cb_wr_phase <= 0;
-        cr_wr_row    <= 0;  cr_wr_waddr <= 0;  cr_wr_phase <= 0;
-        cb_wr_strip_sel <= '0';
-        cr_wr_strip_sel <= '0';
-        cb_strip_rdy_r  <= '0';
-        cr_strip_rdy_r  <= '0';
-      else
-        cb_strip_rdy_r <= '0';
-        cr_strip_rdy_r <= '0';
-
-        -- Detect start of new frame (reset chroma state)
-        if s_tvalid = '1' and s_tuser = '1' then
-          chr_active   <= '0';
-          chr_is_cr    <= '0';
-          chr_line_cnt <= (others => '0');
-          cb_wr_row  <= 0;  cb_wr_waddr <= 0;  cb_wr_phase <= 0;
-          cr_wr_row  <= 0;  cr_wr_waddr <= 0;  cr_wr_phase <= 0;
-          cb_wr_strip_sel <= '0';
-          cr_wr_strip_sel <= '0';
-        end if;
-
-        -- Optional external reset at Cb→Cr boundary (safety, mostly redundant
-        -- since chr_line_cnt auto-switches at chroma_height)
+        -- -----------------------------------------------------------------
+        -- Optional external reset at Cb→Cr boundary
+        -- -----------------------------------------------------------------
         if chroma_plane_rst = '1' then
-          chr_is_cr    <= '1';
-          chr_line_cnt <= (others => '0');
-          cr_wr_row    <= 0;  cr_wr_waddr <= 0;  cr_wr_phase <= 0;
+          chr_is_cr       <= '1';
+          chr_line_cnt    <= (others => '0');
+          cr_wr_row       <= 0;  cr_wr_waddr <= 0;  cr_wr_phase <= 0;
           cr_wr_strip_sel <= '0';
         end if;
 
-        -- Activate chroma capture when luma finishes (y_active goes '0')
-        if y_active = '0' and s_tvalid = '1' and s_tuser = '0' then
+        -- -----------------------------------------------------------------
+        -- Chroma write: Cb → rows 16-31, Cr → rows 32-47.
+        -- Fires for all chroma bytes (y_active='0', s_tuser='0').
+        -- chr_active is set here on the first byte so the first Cb byte
+        -- is not lost due to the one-cycle activation delay in a separate
+        -- process.
+        -- -----------------------------------------------------------------
+        if s_tvalid = '1' and y_active = '0' and s_tuser = '0' then
           chr_active <= '1';
-        end if;
-
-        if s_tvalid = '1' and chr_active = '1' and y_active = '0' then
 
           if chr_is_cr = '0' then
-            -- ---------------------------------------------------------------
             -- Writing Cb → rows 16-23 (bank A) or 24-31 (bank B)
-            -- ---------------------------------------------------------------
             if chr_line_cnt < chroma_height then
               buf := cb_wr_buf;
               buf(cb_wr_phase*8+7 downto cb_wr_phase*8) := s_tdata;
@@ -388,8 +374,8 @@ begin
               cb_wr_phase <= 0;
               if chr_line_cnt < chroma_height then
                 if cb_wr_row = 7 then
-                  cb_wr_row      <= 0;
-                  cb_strip_rdy_r <= '1';
+                  cb_wr_row       <= 0;
+                  cb_strip_rdy_r  <= '1';
                   cb_wr_strip_sel <= not cb_wr_strip_sel;
                 else
                   cb_wr_row <= cb_wr_row + 1;
@@ -403,9 +389,7 @@ begin
             end if;
 
           else
-            -- ---------------------------------------------------------------
             -- Writing Cr → rows 32-39 (bank A) or 40-47 (bank B)
-            -- ---------------------------------------------------------------
             if chr_line_cnt < chroma_height then
               buf := cr_wr_buf;
               buf(cr_wr_phase*8+7 downto cr_wr_phase*8) := s_tdata;
@@ -430,8 +414,8 @@ begin
               cr_wr_phase <= 0;
               if chr_line_cnt < chroma_height then
                 if cr_wr_row = 7 then
-                  cr_wr_row      <= 0;
-                  cr_strip_rdy_r <= '1';
+                  cr_wr_row       <= 0;
+                  cr_strip_rdy_r  <= '1';
                   cr_wr_strip_sel <= not cr_wr_strip_sel;
                 else
                   cr_wr_row <= cr_wr_row + 1;

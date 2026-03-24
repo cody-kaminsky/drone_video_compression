@@ -443,6 +443,12 @@ def main():
             for c in range(W):
                 ref_frame[r * W + c] = Y[r][c]
 
+        # Debug: print Cb range
+        all_cb = [v for row in Cb for v in row]
+        print(f"  Cb range: min={min(all_cb)} max={max(all_cb)} mean={sum(all_cb)//len(all_cb)}")
+        all_cr = [v for row in Cr for v in row]
+        print(f"  Cr range: min={min(all_cr)} max={max(all_cr)} mean={sum(all_cr)//len(all_cr)}")
+
         output_frames.append((Y, Cb, Cr))
 
         # Stop if we've consumed the entire bitstream
