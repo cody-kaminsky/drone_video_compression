@@ -150,8 +150,16 @@ architecture rtl of mb_buffer is
   signal row_regs     : row_reg_t;
   signal rd_fetch_row : integer range 0 to 7           := 0;
   signal rd_waddr     : integer range 0 to ROW_STRIDE-1 := 0;
-  signal rd_data      : std_logic_vector(63 downto 0);
   signal fetch_cnt    : integer range 0 to 9           := 0;
+
+  -- Separate registered outputs from each BRAM (enables block-RAM inference
+  -- by giving each array a clean single-source read pattern).
+  signal rd_data_y    : std_logic_vector(63 downto 0);
+  signal rd_data_cb   : std_logic_vector(63 downto 0);
+  signal rd_data_cr   : std_logic_vector(63 downto 0);
+  signal rd_data      : std_logic_vector(63 downto 0);
+  -- Plane selector registered 1 cycle (aligned with BRAM read latency)
+  signal rd_sel_d1    : std_logic_vector(1 downto 0) := "00";
 
   -- =========================================================================
   -- Emit FSM (luma + chroma states)
@@ -225,27 +233,58 @@ begin
               else '0';
 
   -- =========================================================================
-  -- BRAM synchronous read (1-cycle latency) – bank selected per FSM state
+  -- BRAM synchronous reads (1-cycle latency)
+  -- Three separate processes, one per array, so Vivado sees each lb_y/cb/cr
+  -- as an independent single-source read → enables block-RAM inference.
+  -- All three read every cycle; the correct output is selected by rd_sel_d1.
   -- =========================================================================
+
+  -- Luma BRAM read
   process(aclk)
     variable rd_row : integer range 0 to 15;
   begin
     if rising_edge(aclk) then
+      if rd_strip_sel = '1' then rd_row := 8; else rd_row := 0; end if;
+      rd_data_y <= lb_y(lb_addr(rd_row + rd_fetch_row, rd_waddr));
+    end if;
+  end process;
+
+  -- Cb BRAM read
+  process(aclk)
+    variable rd_row : integer range 0 to 15;
+  begin
+    if rising_edge(aclk) then
+      if cb_rd_strip_sel = '1' then rd_row := 8; else rd_row := 0; end if;
+      rd_data_cb <= lb_cb(lb_addr(rd_row + rd_fetch_row, rd_waddr));
+    end if;
+  end process;
+
+  -- Cr BRAM read
+  process(aclk)
+    variable rd_row : integer range 0 to 15;
+  begin
+    if rising_edge(aclk) then
+      if cr_rd_strip_sel = '1' then rd_row := 8; else rd_row := 0; end if;
+      rd_data_cr <= lb_cr(lb_addr(rd_row + rd_fetch_row, rd_waddr));
+    end if;
+  end process;
+
+  -- Register plane selector in sync with BRAM read (1-cycle latency alignment)
+  process(aclk)
+  begin
+    if rising_edge(aclk) then
       if use_chroma_rd = '0' then
-        -- Luma: bank A (rows 0-7) or bank B (rows 8-15)
-        if rd_strip_sel = '1' then rd_row := 8; else rd_row := 0; end if;
-        rd_data <= lb_y(lb_addr(rd_row + rd_fetch_row, rd_waddr));
-      elsif plane_sel = "01" then
-        -- Cb: bank A (rows 0-7) or bank B (rows 8-15) of lb_cb
-        if cb_rd_strip_sel = '1' then rd_row := 8; else rd_row := 0; end if;
-        rd_data <= lb_cb(lb_addr(rd_row + rd_fetch_row, rd_waddr));
+        rd_sel_d1 <= "00";
       else
-        -- Cr: bank A (rows 0-7) or bank B (rows 8-15) of lb_cr
-        if cr_rd_strip_sel = '1' then rd_row := 8; else rd_row := 0; end if;
-        rd_data <= lb_cr(lb_addr(rd_row + rd_fetch_row, rd_waddr));
+        rd_sel_d1 <= plane_sel;
       end if;
     end if;
   end process;
+
+  -- Output mux: select correct BRAM output (combinatorial, after registered reads)
+  rd_data <= rd_data_cb when rd_sel_d1 = "01" else
+             rd_data_cr when rd_sel_d1 = "10" else
+             rd_data_y;
 
   -- =========================================================================
   -- Combined BRAM write process (luma + chroma) — single driver for lb.

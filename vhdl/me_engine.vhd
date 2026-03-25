@@ -1,46 +1,27 @@
 -- =============================================================================
--- me_engine.vhd  --  8x8 block motion estimator (diamond search + half-pixel)
+-- me_engine.vhd  --  8x8 block motion estimator (integer-only diamond search)
 --
--- Implements a 3-step diamond search followed by half-pixel refinement,
--- matching inter_search_integer + inter_refine_halfpel in predict.c.
+-- Implements a 3-step diamond search (integer-pel only).
+-- Half-pixel refinement has been removed to reduce LUT usage.
+-- Output MV is expressed in half-pel units (LSB always 0) so that the
+-- downstream halfpel_mc / enc_top interface is unchanged.
 --
 -- Search strategy
 -- ---------------
---   1. Integer search — iterative diamond:
---        Start at (0,0).  At each step, test 4 or 8 neighbours at the current
---        stride (4, 2, 1 pixels).  Move to the best.  Repeat at next stride.
---        Total: ~25 SAD evaluations.
---   2. Half-pixel refinement — test 8 half-pel positions around the best
---        integer MV.  Half-pel interpolation is bilinear (same as C encoder).
---        Total: 8 SAD evaluations.
---
--- SAD computation
--- ---------------
---   Current block (8x8 = 64 pixels) is buffered in registers.
---   Reference block is fetched from the search-window BRAM via rd_addr/rd_data.
---   One row of 8 pixels per clock is compared; SAD accumulates over 8 clocks
---   per candidate + 2 pipeline overhead = 10 clocks per candidate.
---   Sequential (single SAD pipeline), targeting ~720p@30fps throughput.
---   For 4K, instantiate 4-8 me_engine instances in parallel (one per MB-row
---   quadrant) — add parallelism externally without redesigning this module.
+--   Integer search — iterative diamond:
+--     Start at (0,0).  At each step, test 5 points (centre + 4 orthogonal)
+--     at the current stride (4, 2, 1 pixels).  Move to the best.
+--     Total: ~25 SAD evaluations, ~280 clocks per 8x8 block.
 --
 -- Skip decision
 -- -------------
---   After finding best MV, if best_sad < SKIP_THRESH (= 16*16*2/4 = 128 for
---   8x8 blocks), the skip flag is asserted and no residual is transmitted.
---
--- Interface
--- ---------
---   blk_start : pulse — start ME for a new 8x8 block
---   cur_row   : current block pixels (one row of 8, presented during LOAD)
---   cur_valid : one per clock during LOAD (8 clocks)
---   blk_x/y   : top-left pixel coordinate of current block
---   Output    : mv, skip, me_done
+--   After finding best MV, if best_sad < SKIP_THRESH (128 for 8x8 blocks),
+--   the skip flag is asserted and no residual is transmitted.
 --
 -- Resource estimate
 -- -----------------
---   LUT : ~1200  (SAD accumulator, diamond FSM, BRAM address logic)
---   FF  : ~600
+--   LUT : ~800   (SAD accumulator, diamond FSM, BRAM address logic)
+--   FF  : ~400
 --   DSP : 0      (8-bit ABS differences fit in LUT)
 -- =============================================================================
 library ieee;
@@ -92,8 +73,7 @@ architecture rtl of me_engine is
   -- ---------------------------------------------------------------------------
   -- FSM
   -- ---------------------------------------------------------------------------
-  type state_t is (IDLE, LOAD, SEARCH_INIT, SAD_ISSUE, SAD_ACC, SAD_COMPARE,
-                   HALFPEL_INIT, HP_ISSUE, HP_ACC, HP_COMPARE, DONE);
+  type state_t is (IDLE, LOAD, SEARCH_INIT, SAD_ISSUE, SAD_ACC, SAD_COMPARE, DONE);
   signal state : state_t := IDLE;
 
   -- ---------------------------------------------------------------------------
@@ -127,49 +107,19 @@ architecture rtl of me_engine is
   signal blk_px   : unsigned(11 downto 0) := (others => '0');
   signal blk_py   : unsigned(11 downto 0) := (others => '0');
 
-  -- ---------------------------------------------------------------------------
-  -- Half-pixel refinement state
-  -- ---------------------------------------------------------------------------
-  -- 8 half-pixel offsets: (±1, 0), (0, ±1), (±1, ±1)
-  type hp_offset_t is record
-    dx : integer range -1 to 1;
-    dy : integer range -1 to 1;
-  end record;
-  type hp_offsets8_t is array(0 to 7) of hp_offset_t;
-  constant HP8 : hp_offsets8_t := (
-    (dx =>  1, dy =>  0), (dx => -1, dy =>  0),
-    (dx =>  0, dy =>  1), (dx =>  0, dy => -1),
-    (dx =>  1, dy =>  1), (dx => -1, dy =>  1),
-    (dx =>  1, dy => -1), (dx => -1, dy => -1)
-  );
-  signal hp_idx   : integer range 0 to 7 := 0;
-  signal hp_mv_dx : signed(6 downto 0) := (others => '0');  -- half-pixel MV
-  signal hp_mv_dy : signed(6 downto 0) := (others => '0');
+  -- Half-pixel refinement removed; integer MV is output in half-pel units (LSB=0).
 
   -- ---------------------------------------------------------------------------
   -- SAD accumulator
   -- ---------------------------------------------------------------------------
   signal sad_row   : integer range 0 to 7 := 0;   -- which row being summed
-  signal sad_sum   : unsigned(19 downto 0) := (others => '0');  -- renamed: sad_sum clashes with SAD_ACC state
-  signal sad_cur   : unsigned(19 downto 0);  -- running partial SAD
+  signal sad_sum   : unsigned(19 downto 0) := (others => '0');
   signal ref_row_r : std_logic_vector(63 downto 0);  -- latched reference row
-  signal ref_rd_r  : std_logic := '0';  -- BRAM read issued this cycle
+  signal ref_rd_r  : std_logic := '0';
 
   -- Reference row address calculation
-  signal ref_y_int  : signed(12 downto 0) := (others => '0');  -- ref y (integer)
-  signal ref_x_int  : signed(12 downto 0) := (others => '0');  -- ref x (integer)
-
-  -- Half-pixel: bilinear interpolation registers
-  -- hp_phase: 0=row_y/col0 just arrived  1=row_y/col1 arriving
-  --           2=row_y+1/col0 arriving     3=row_y+1/col1 arriving
-  signal hp_xf      : std_logic := '0';   -- x sub-pixel flag for current HP candidate
-  signal hp_yf      : std_logic := '0';   -- y sub-pixel flag
-  signal hp_x_off   : integer range 0 to 7 := 0;  -- ref_x mod 8 (byte offset in word)
-  signal hp_x_col   : integer range 0 to 479 := 0; -- ref_x / 8 (base BRAM column)
-  signal hp_w0      : std_logic_vector(63 downto 0);  -- row_y,   col0
-  signal hp_w1      : std_logic_vector(63 downto 0);  -- row_y,   col1 (xf=1)
-  signal hp_w2      : std_logic_vector(63 downto 0);  -- row_y+1, col0 (yf=1)
-  signal hp_phase   : integer range 0 to 3 := 0;
+  signal ref_y_int  : signed(12 downto 0) := (others => '0');
+  signal ref_x_int  : signed(12 downto 0) := (others => '0');
 
   -- ---------------------------------------------------------------------------
   -- Helper functions
@@ -196,70 +146,6 @@ architecture rtl of me_engine is
     return resize(s, 20);
   end function;
 
-  -- Extract byte at position (off+idx) from a 16-byte span across two BRAM words.
-  -- w0 = bytes 0..7, w1 = bytes 8..15.
-  function pick_byte(w0, w1 : std_logic_vector(63 downto 0);
-                     off, idx : integer) return std_logic_vector is
-    variable pos : integer;
-  begin
-    pos := off + idx;
-    if pos < 8 then
-      return w0(pos*8+7 downto pos*8);
-    else
-      return w1((pos-8)*8+7 downto (pos-8)*8);
-    end if;
-  end function;
-
-  -- Compute SAD for one bilinear-interpolated row.
-  -- w00/w01 = row_y  word0/word1; w10/w11 = row_y+1 word0/word1.
-  -- x_off: byte offset of first pixel within word pair (= ref_x mod 8).
-  -- xf/yf: sub-pixel flags.
-  function hp_row_sad(cur             : std_logic_vector(63 downto 0);
-                      w00, w01, w10, w11 : std_logic_vector(63 downto 0);
-                      x_off           : integer;
-                      xf, yf          : std_logic) return unsigned is
-    variable s    : unsigned(11 downto 0) := (others => '0');
-    variable p00, p01, p10, p11 : unsigned(7 downto 0);
-    variable interp : unsigned(7 downto 0);
-    variable sum2   : unsigned(8 downto 0);   -- 2x 8-bit + 1 = max 511, 9 bits
-    variable sum4   : unsigned(9 downto 0);   -- 4x 8-bit + 2 = max 1022, 10 bits
-  begin
-    for i in 0 to 7 loop
-      p00 := unsigned(pick_byte(w00, w01, x_off, i));
-      if xf = '1' then
-        p01 := unsigned(pick_byte(w00, w01, x_off, i + 1));
-      else
-        p01 := (others => '0');
-      end if;
-      if yf = '1' then
-        p10 := unsigned(pick_byte(w10, w11, x_off, i));
-        if xf = '1' then
-          p11 := unsigned(pick_byte(w10, w11, x_off, i + 1));
-        else
-          p11 := (others => '0');
-        end if;
-      else
-        p10 := (others => '0');
-        p11 := (others => '0');
-      end if;
-      if xf = '1' and yf = '0' then
-        sum2   := ('0' & p00) + ('0' & p01) + 1;
-        interp := sum2(8 downto 1);
-      elsif xf = '0' and yf = '1' then
-        sum2   := ('0' & p00) + ('0' & p10) + 1;
-        interp := sum2(8 downto 1);
-      elsif xf = '1' and yf = '1' then
-        sum4   := ("00" & p00) + ("00" & p01) + ("00" & p10) + ("00" & p11) + 2;
-        interp := sum4(9 downto 2);
-      else
-        interp := p00;
-      end if;
-      s := s + resize(abs_diff(cur(i*8+7 downto i*8),
-                               std_logic_vector(interp)), 12);
-    end loop;
-    return resize(s, 20);
-  end function;
-
   signal me_done_r  : std_logic := '0';
   signal skip_out_r : std_logic := '0';
 
@@ -278,8 +164,6 @@ begin
     variable stride         : integer;
     variable fr_width       : integer;
     variable fr_height      : integer;
-    variable hp_sum_x       : signed(6 downto 0);
-    variable hp_sum_y       : signed(6 downto 0);
   begin
     if rising_edge(aclk) then
       if aresetn = '0' then
@@ -408,11 +292,8 @@ begin
             if cand_idx = 4 then
               -- Finished all 5 candidates for this stride
               if search_stride = 1 then
-                -- Integer search done; start half-pixel
-                hp_idx  <= 0;
-                hp_mv_dx <= best_mv_dx & '0';  -- convert to half-pel units (x2)
-                hp_mv_dy <= best_mv_dy & '0';
-                state    <= HALFPEL_INIT;
+                -- Integer search done; output result (MV in half-pel units, LSB=0)
+                state <= DONE;
               else
                 -- Reduce stride
                 if search_stride = 4 then search_stride <= 2;
@@ -427,126 +308,11 @@ begin
             end if;
 
           -- ------------------------------------------------------------------
-          -- HALFPEL_INIT: set up half-pixel refinement
-          -- ------------------------------------------------------------------
-          when HALFPEL_INIT =>
-            hp_idx    <= 0;
-            sad_row   <= 0;
-            sad_sum   <= (others => '0');
-            hp_phase  <= 0;
-            state     <= HP_ISSUE;
-
-          -- ------------------------------------------------------------------
-          -- HP_ISSUE: set up bilinear half-pixel SAD for one candidate.
-          -- Computes xf/yf flags and issues BRAM read for row 0, word 0.
-          -- ------------------------------------------------------------------
-          when HP_ISSUE =>
-            dx_off := HP8(hp_idx).dx;
-            dy_off := HP8(hp_idx).dy;
-            -- Integer pixel position = (half-pel MV + offset) >> 1
-            cand_x := to_signed(to_integer(blk_px), 13)
-                     + resize(shift_right(hp_mv_dx + to_signed(dx_off, 7), 1), 13);
-            cand_y := to_signed(to_integer(blk_py), 13)
-                     + resize(shift_right(hp_mv_dy + to_signed(dy_off, 7), 1), 13);
-            -- Sub-pixel flags: LSB of total half-pel MV + offset
-            hp_sum_x := hp_mv_dx + to_signed(dx_off, 7);
-            hp_sum_y := hp_mv_dy + to_signed(dy_off, 7);
-            hp_xf <= hp_sum_x(0);
-            hp_yf <= hp_sum_y(0);
-            fr_width  := to_integer(frame_width);
-            fr_height := to_integer(frame_height);
-            if cand_x < 0 then cand_x := to_signed(0, 13); end if;
-            if cand_y < 0 then cand_y := to_signed(0, 13); end if;
-            if cand_x > to_signed(fr_width - 9, 13) then
-              cand_x := to_signed(fr_width - 9, 13);   -- leave room for x+1
-            end if;
-            if cand_y > to_signed(fr_height - 9, 13) then
-              cand_y := to_signed(fr_height - 9, 13);  -- leave room for y+1
-            end if;
-            ref_y_int   <= cand_y;
-            ref_x_int   <= cand_x;
-            hp_x_off    <= to_integer(unsigned(cand_x(2 downto 0)));   -- mod 8
-            hp_x_col    <= to_integer(unsigned(cand_x(11 downto 3)));  -- /8
-            ref_bram_row := to_integer(cand_y(5 downto 0)) mod 40;
-            ref_bram_col := to_integer(unsigned(cand_x(11 downto 3)));
-            ref_rd_addr  <= std_logic_vector(to_unsigned(ref_bram_row, 6)) &
-                             std_logic_vector(to_unsigned(ref_bram_col, 9));
-            sad_row  <= 0;
-            sad_sum  <= (others => '0');
-            hp_phase <= 0;
-            state    <= HP_ACC;
-
-          -- ------------------------------------------------------------------
-          -- HP_ACC: accumulate bilinear-interpolated SAD over 8 rows.
-          --
-          -- Always fetches 4 BRAM words per row (2 x-cols × 2 y-rows) to
-          -- support arbitrary alignment (hp_x_off) and all xf/yf combinations.
-          --
-          -- hp_phase 0: row_y,   col0 arrives → latch hp_w0; issue row_y,   col1
-          -- hp_phase 1: row_y,   col1 arrives → latch hp_w1; issue row_y+1, col0
-          -- hp_phase 2: row_y+1, col0 arrives → latch hp_w2; issue row_y+1, col1
-          -- hp_phase 3: row_y+1, col1 arrives → compute SAD; issue next row col0
-          -- ------------------------------------------------------------------
-          when HP_ACC =>
-            case hp_phase is
-
-              when 0 =>
-                hp_w0 <= ref_rd_data;
-                ref_bram_row := (to_integer(ref_y_int) + sad_row) mod 40;
-                ref_rd_addr  <= std_logic_vector(to_unsigned(ref_bram_row, 6)) &
-                                 std_logic_vector(to_unsigned(hp_x_col + 1, 9));
-                hp_phase <= 1;
-
-              when 1 =>
-                hp_w1 <= ref_rd_data;
-                ref_bram_row := (to_integer(ref_y_int) + sad_row + 1) mod 40;
-                ref_rd_addr  <= std_logic_vector(to_unsigned(ref_bram_row, 6)) &
-                                 std_logic_vector(to_unsigned(hp_x_col, 9));
-                hp_phase <= 2;
-
-              when 2 =>
-                hp_w2 <= ref_rd_data;
-                ref_bram_row := (to_integer(ref_y_int) + sad_row + 1) mod 40;
-                ref_rd_addr  <= std_logic_vector(to_unsigned(ref_bram_row, 6)) &
-                                 std_logic_vector(to_unsigned(hp_x_col + 1, 9));
-                hp_phase <= 3;
-
-              when 3 =>
-                -- All 4 words latched: hp_w0=row_y/col0, hp_w1=row_y/col1,
-                --                      hp_w2=row_y+1/col0, ref_rd_data=row_y+1/col1
-                row_sad_v := hp_row_sad(cur_buf(sad_row),
-                                        hp_w0, hp_w1, hp_w2, ref_rd_data,
-                                        hp_x_off, hp_xf, hp_yf);
-                sad_sum <= sad_sum + row_sad_v;
-                if sad_row = 7 then
-                  state <= HP_COMPARE;
-                else
-                  ref_bram_row := (to_integer(ref_y_int) + sad_row + 1) mod 40;
-                  ref_rd_addr  <= std_logic_vector(to_unsigned(ref_bram_row, 6)) &
-                                   std_logic_vector(to_unsigned(hp_x_col, 9));
-                  sad_row  <= sad_row + 1;
-                  hp_phase <= 0;
-                end if;
-
-            end case;
-
-          when HP_COMPARE =>
-            if sad_sum < best_sad then
-              best_sad <= sad_sum;
-              hp_mv_dx <= hp_mv_dx + to_signed(HP8(hp_idx).dx, 7);
-              hp_mv_dy <= hp_mv_dy + to_signed(HP8(hp_idx).dy, 7);
-            end if;
-            if hp_idx = 7 then
-              state <= DONE;
-            else
-              hp_idx <= hp_idx + 1;
-              state  <= HP_ISSUE;
-            end if;
-
-          -- ------------------------------------------------------------------
           when DONE =>
-            mv_out.dx  <= resize(hp_mv_dx, 7);
-            mv_out.dy  <= resize(hp_mv_dy, 7);
+            -- Output integer MV in half-pel units (append '0' LSB so
+            -- halfpel_mc always takes the integer-pel path, no interpolation).
+            mv_out.dx  <= best_mv_dx & '0';
+            mv_out.dy  <= best_mv_dy & '0';
             if best_sad < to_unsigned(SKIP_THRESH, 20) then
               skip_out_r <= '1';
             else
