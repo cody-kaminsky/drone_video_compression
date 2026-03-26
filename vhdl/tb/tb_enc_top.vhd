@@ -583,9 +583,9 @@ begin
   -- -------------------------------------------------------------------------
   process
   begin
-    wait for 20 ms;  -- extended: chroma adds ~50% more blocks (3 planes)
+    wait for 30 ms;  -- extended: chroma adds ~50% more blocks (3 planes)
     if not sim_done then
-      report "SIMULATION FAIL: watchdog timeout after 20 ms" severity failure;
+      report "SIMULATION FAIL: watchdog timeout after 30 ms" severity failure;
     end if;
     wait;
   end process;

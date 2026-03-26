@@ -1,0 +1,658 @@
+================================================================================
+DRONE VIDEO COMPRESSION — VHDL ARCHITECTURE REFERENCE
+H.264/H.265-style Encoder for FPGA (Xilinx UltraScale+ / Zynq)
+Target: 1080p / 4K @ 30fps, 200 MHz clock
+================================================================================
+
+================================================================================
+1. OVERVIEW
+================================================================================
+
+This FPGA encoder implements an H.264/H.265-inspired video compression pipeline
+in VHDL targeting the Xilinx UltraScale+ SoC (Zynq). It encodes YUV 4:2:0 video
+over an AXI-Stream video input interface and outputs a compressed bitstream over
+an AXI-Stream master interface. A Zynq PS ARM core controls the encoder via
+AXI-Lite registers.
+
+  Input:   AXI-Stream 8-bit YUV 4:2:0 pixels, up to 4K (3840×2160)
+  Output:  AXI-Stream compressed bitstream (bytes, frame-delimited)
+  Control: AXI-Lite register interface (from PS)
+  DDR:     AXI4 HP master for reference frame storage/prefetch
+
+Supported frame types: I-frames (intra-coded) and P-frames (motion-compensated)
+organized into a configurable GOP (Group of Pictures) structure.
+
+================================================================================
+2. MODULE HIERARCHY
+================================================================================
+
+enc_top                         Top-level orchestration
+├── enc_ctrl                    AXI-Lite control register interface
+├── frame_ctrl                  GOP / frame-type controller
+├── mb_buffer                   YUV 4:2:0 macroblock line buffer + intra predictor
+├── me_engine                   Motion estimator (diamond search + half-pel refine)
+├── halfpel_mc                  Half-pixel motion compensation (bilinear interpolation)
+├── ref_frame_ddr               DDR reference frame manager + BRAM search window
+├── dct8_fwd                    Forward 8×8 DCT (AAN, pipelined)
+├── quant_enc                   Forward quantizer (reciprocal multiply, no division)
+├── zigzag                      Zigzag reorder + trailing-zero suppression
+├── exp_golomb                  Exponential-Golomb entropy coder
+├── bs_packer                   Variable-length bitstream packer
+├── dct8_inv                    Inverse 8×8 DCT (pipelined)
+└── recon_writer                Reconstruction loop: dequant → IDCT → add prediction
+
+================================================================================
+3. MODULE DESCRIPTIONS
+================================================================================
+
+--------------------------------------------------------------------------------
+enc_top.vhd — Top-Level Encoder Orchestration (~650 lines)
+--------------------------------------------------------------------------------
+Master FSM that connects all pipeline stages and drives data flow.
+
+I-Frame Flow:
+  mb_buffer → dct8_fwd → quant_enc → zigzag → exp_golomb → bs_packer
+  Injects intra mode header + DC DPCM (differential DC coding)
+  Quantized coefficients also sent to recon_writer for loop reconstruction
+
+P-Frame Flow:
+  1. Capture 8×8 block from mb_buffer into cur_blk_buf
+  2. me_engine runs diamond + half-pel search (~300 clocks)
+  3. bs_packer receives skip flag + MV headers
+  4. If not skip: halfpel_mc generates prediction rows
+  5. Residual = current − prediction → dct8_fwd → quant → zigzag → entropy
+  6. recon_writer produces reconstructed pixels → ref_frame_ddr
+
+Chroma Flow:
+  After luma, FSM transitions PHASE_LUMA → PHASE_CB → PHASE_CR
+  Chroma encoded with INTRA_DC mode (no motion estimation)
+  Chroma blocks are 4×4 pixels (4:2:0 subsampling)
+
+Key internal FSMs:
+  - P-block FSM: PBLK_IDLE → PBLK_CAPTURE → PBLK_ME_WAIT →
+                 PBLK_HDR_SKIP/MV → PBLK_MC_EMIT → PBLK_SKIP_DONE
+  - Phase FSM:   PHASE_LUMA → PHASE_WAIT_CB → PHASE_CB →
+                 PHASE_WAIT_CR → PHASE_CR
+  - Serializer:  SER_REQUEST → SER_CAPTURE → SER_EMIT
+
+AXI Interfaces:
+  Slave:  s_axis_video (8-bit pixel stream, tuser=SOF, tlast=EOL)
+  Master: m_axis_bitstream (8-bit byte stream, tlast=EOF)
+  Slave:  AXI-Lite control (from Zynq PS)
+  Master: AXI4 HP DDR (64-bit, burst-16 for reference frame)
+
+Resource estimate:  ~500 LUTs, ~400 FFs, 0 DSP, 0 BRAM
+
+--------------------------------------------------------------------------------
+enc_ctrl.vhd — AXI-Lite Control Register Interface (~220 lines)
+--------------------------------------------------------------------------------
+Maps AXI-Lite transactions to encoder control/status registers.
+
+Register Map (32-bit words):
+  0x00  CTRL        [0]=enable, [1]=soft-reset
+  0x04  STATUS      [0]=busy, [1]=frame_done (W1C), [2]=error
+  0x08  WIDTH       12-bit frame width
+  0x0C  HEIGHT      12-bit frame height
+  0x10  QP          6-bit quantization parameter (1–51)
+  0x14  GOP_SIZE    8-bit GOP length (1=I-only, N=IPPPP...)
+  0x18  FRAME_CNT   32-bit frame counter (read-only)
+  0x1C  BS_BYTES    bitstream bytes in last frame (read-only)
+  0x20  REF_BASE    DDR base address for reference frame
+
+Resource estimate:  ~150 LUTs, ~200 FFs, 0 DSP, 0 BRAM
+
+--------------------------------------------------------------------------------
+frame_ctrl.vhd — GOP / Frame-Type Controller (~94 lines)
+--------------------------------------------------------------------------------
+Determines frame type (INTRA_I or FRAME_P) based on GOP position.
+
+  - Tracks encoded frame count modulo GOP_SIZE
+  - Asserts frame_start pulse at SOF (from s_tuser)
+  - Outputs stable frame_type for entire frame duration
+  - Increments gop_pos on frame_done pulse
+
+Resource estimate:  ~30 LUTs, ~20 FFs, 0 DSP, 0 BRAM
+
+--------------------------------------------------------------------------------
+mb_buffer.vhd — YUV 4:2:0 Macroblock Line Buffer + Intra Predictor (~400+ lines)
+--------------------------------------------------------------------------------
+Stores incoming video stream in BRAM banks; provides 8×8 blocks to encoder;
+performs intra prediction mode selection using neighbor pixels.
+
+BRAM Layout:
+  3 banks (Y, Cb, Cr), each: 16 rows × 512 words × 64-bit
+  8 pixels per 64-bit word (8-byte row stride)
+  Total: 3 × 8 KB = 24 KB active (scales to 4K)
+
+Intra Prediction Modes:
+  INTRA_DC    (00): Predictor = 128 (flat, used for first block)
+  INTRA_HORIZ (01): Use left column pixels (bx > 0)
+  INTRA_VERT  (10): Use above row pixels (subsequent strips)
+  INTRA_PLANAR(11): Not implemented in current version
+
+Outputs per block:
+  m_tdata       72-bit: 8 pixels packed (8×9-bit)
+  m_pred_dc     DC predictor value (default 128)
+  m_intra_mode  Selected prediction mode
+  m_above_row   8 pixels from row above (for VERT prediction)
+  m_left_col    8 pixels from left column (for HORIZ prediction)
+  strip_rdy_out Asserted when a full strip is ready
+
+Plane selection:
+  plane_sel input ("00"=Y, "01"=Cb, "10"=Cr) controls emit side
+  Write side auto-detects Cb/Cr transition from stream timing
+
+Resource estimate:  ~800 LUTs, ~600 FFs, 0 DSP, ~6 BRAM18 (3 per plane)
+
+--------------------------------------------------------------------------------
+me_engine.vhd — Motion Estimator (~380+ lines)
+--------------------------------------------------------------------------------
+Finds best motion vector for P-frame 8×8 blocks via integer-pel diamond search
+followed by half-pixel refinement.
+
+Search Algorithm:
+  1. Integer Search: 3-stride diamond (stride 4 → 2 → 1), ~25 SAD evaluations
+     One SAD row computed per clock; 8 clocks per candidate + 2 overhead = 10 clocks/candidate
+  2. Half-Pixel Refinement: 8 positions around best integer MV tested
+  3. Skip Decision: If best_sad < SKIP_THRESH (128), assert skip flag
+
+Current Block Buffer:
+  8×8 = 64 bytes registered in local array
+
+Reference Access:
+  Reads from BRAM via rd_addr/rd_data (1-cycle latency, supplied by ref_frame_ddr)
+
+Outputs:
+  mv_out    Half-pixel MV (±64 range in half-pel units, signed 7-bit each axis)
+  skip_out  '1' if SAD below threshold
+  me_done   Pulse when search complete
+
+FSM States:
+  IDLE → LOAD → SEARCH_INIT → SAD_ISSUE → SAD_ACC → SAD_COMPARE →
+  HALFPEL_INIT → HP_ISSUE → HP_ACC → HP_COMPARE → DONE
+
+Resource estimate:  ~1200 LUTs, ~600 FFs, 0 DSP, 0 BRAM
+
+--------------------------------------------------------------------------------
+halfpel_mc.vhd — Half-Pixel Motion Compensation (~280 lines)
+--------------------------------------------------------------------------------
+Generates prediction pixels using bilinear interpolation at half-pixel positions.
+
+Half-Pixel Representation:
+  mv.dx, mv.dy in half-pel units (±64)
+  Integer MV = mv >> 1; Sub-pixel flag = mv & 1
+
+Interpolation Cases:
+  (xf=0, yf=0): Integer-pel copy (no interpolation)
+  (xf=1, yf=0): Horizontal half-pel: (A + B + 1) >> 1
+  (xf=0, yf=1): Vertical half-pel:   (A + B + 1) >> 1
+  (xf=1, yf=1): Quarter-pel:         (A + B + C + D + 2) >> 2
+
+BRAM Access:
+  Up to 4 reads per row (if straddling 64-bit word boundaries)
+  Latency: blk_start → first mc_valid = 3 clocks (2 BRAM + 1 interpolate)
+
+Output: mc_row (8 pixels/clock), mc_valid, mc_last
+
+FSM: IDLE → FETCH_R0W0 → FETCH_R0W1 → FETCH_R1W0/R1W1 (yf=1) → INTERPOLATE
+
+Resource estimate:  ~200 LUTs, ~150 FFs, 0 DSP, 0 BRAM
+
+--------------------------------------------------------------------------------
+ref_frame_ddr.vhd — DDR Reference Frame Manager + BRAM Search Window (~400+ lines)
+--------------------------------------------------------------------------------
+Dual-purpose module: manages AXI4 DDR reference frame and maintains a circular
+40-row BRAM search window for the motion estimator.
+
+Write Path:
+  Accepts reconstructed 8×8 blocks → writes to DDR at correct luma address
+  DDR address = ref_base + y*stride + x (stride = roundup(frame_width, 8))
+
+BRAM Search Window:
+  40 rows × MAX_WIDTH(480 for 4K) × 64-bit = 307.2 KB
+  Circular mapping: bram_row = ref_pixel_y mod BRAM_ROWS
+  Port A: Write (DDR prefetch + reconstruction)
+  Port B: Read (me_engine + halfpel_mc)
+
+DDR Prefetch:
+  Prefetches reference rows ahead of motion search strip
+  Initiated at strip boundaries from enc_top
+
+AXI4 HP Interface:
+  64-bit data width; max burst 16 beats (AWLEN/ARLEN = 15)
+  Byte addressing, 8-byte aligned
+
+Resource estimate:  ~1100 LUTs, ~800 FFs, 0 DSP, ~42 BRAM36
+
+--------------------------------------------------------------------------------
+dct8_fwd.vhd — Forward 8×8 DCT (AAN Algorithm, Pipelined) (~450 lines)
+--------------------------------------------------------------------------------
+2D integer DCT using row-column decomposition. Implements the AAN algorithm
+with fixed-point constants scaled by 2^13 (CONST_BITS = 13).
+
+Pipeline:
+  FILL  (8 clocks):  Accept one residual row/clock; compute row butterfly
+  COL   (1 clock):   All 8 column butterflies in parallel via DSP chains
+  EMIT  (8 clocks):  Output one DCT coefficient row/clock
+  Total latency: 17 clocks from first input to first output
+
+Input:  72-bit bus — 8 × 9-bit signed residuals packed
+        Bits [8:0]=sample 0, [17:9]=sample 1, ..., [71:63]=sample 7
+Output: 256-bit bus — 8 × 32-bit signed DCT coefficients per row
+
+Arithmetic:
+  Fixed-point constants (all fit in 18 bits → DSP48E2 P-input)
+  Row pass: shift left PASS1_BITS (2), descale by (CONST_BITS − PASS1_BITS)
+  Col pass: descale by (CONST_BITS + PASS1_BITS)
+  Multiplies use 25×18 → DSP48E2; additions use LUT carry-chains
+
+4-Stage FILL Pipeline:
+  Stage 0: Register row_in_r
+  Stage 1: Butterfly additions → row_btfly_r, pre-sums
+  Stage 2: DSP multiplications → row_dsp1_r, row_dsp2_r
+  Stage 3: Final additions + descale → row_buf
+
+Resource estimate:  ~40 DSP58E2 (or ~1500 LUTs if synthesized as LUT multipliers), ~600 FFs, 0 BRAM
+
+--------------------------------------------------------------------------------
+dct8_inv.vhd — Inverse 8×8 DCT (Pipelined) (~350 lines)
+--------------------------------------------------------------------------------
+2D inverse DCT: column pass first, then row pass per output row.
+Same fixed-point constants as forward DCT.
+
+Pipeline:
+  LOAD     (8 clocks):   Accept 8 rows of 32-bit dequantized coefficients
+  COL_ADD  (1 clock):    Column butterfly additions, all 8 cols parallel
+  COL_MUL  (1 clock):    Column multiplications (DSPs)
+  COL_FINAL(1 clock):    Column descale, store in intermediate buffer
+  ROW_EMIT (8×3=24 clocks): Row butterfly + emit, one row per 3 clocks
+  Total: 35 clocks per 8×8 block
+
+Input:  256-bit — 8 × 32-bit signed coefficients
+Output: 128-bit — 8 × 16-bit signed residuals (fits in ±9-bit range)
+
+Descale:
+  Column: IDCT_CONST_BITS + IDCT_PASS1_BITS + 3 = 17
+  Row:    IDCT_CONST_BITS − IDCT_PASS1_BITS + 3 = 15
+
+Resource estimate:  ~40 DSP58E2 (or ~1500 LUTs if synthesized as LUT multipliers), ~700 FFs, 0 BRAM
+
+--------------------------------------------------------------------------------
+quant_enc.vhd — Forward Quantizer (Division-Free) (~160 lines)
+--------------------------------------------------------------------------------
+Quantizes DCT coefficients using precomputed reciprocal ROM (avoids runtime division).
+
+Formula:
+  q = sign(in) × max(0, floor(|in| × recip >> 16))  if |in| >= dead_zone
+  q = 0                                               otherwise
+
+QP Mapping (51 QP values):
+  step = BASE[(qp-1) % 6] << ((qp-1) / 6)
+  BASE = {10, 11, 13, 14, 16, 18}
+  Range: QP 1 → step 10 ... QP 51 → step 2560
+  recip = floor(2^16 / step) — precomputed ROM
+
+Dead-Zone Thresholds (per QP):
+  Intra: dz_intra = step × 3/8  (smaller, allows more coefficients)
+  Inter: dz_inter = step / 2    (larger, more agressive zeroing for P-frames)
+
+I/O: One 32-bit DCT coefficient → one 16-bit quantized coefficient, 1-cycle latency
+Fully pipelined, no backpressure.
+
+Resource estimate:  ~1 DSP58E2 (32×16 multiply), ~20 LUTs, ~30 FFs, 0 BRAM
+
+--------------------------------------------------------------------------------
+zigzag.vhd — Zigzag Scan Reorder + Trailing-Zero Suppression (~180 lines)
+--------------------------------------------------------------------------------
+Reorders 64 quantized coefficients from row-major to zigzag order and suppresses
+trailing zero coefficients for coding efficiency.
+
+Operation:
+  1. FILL (64 clocks): Accept 64 coefficients in natural order, store in LUTRAM
+  2. COUNT (1 clock):  Find last non-zero coefficient in zigzag order (last_nz)
+  3. EMIT (0..64 clocks): Output count prefix then coefficients 0..last_nz
+
+Output tokens:
+  m_tmode='1' (UE):  ue(last_nz + 1)     — count prefix
+  m_tmode='0' (SE):  se(coeff[zigzag[i]]) — coefficient in zigzag order
+  All-zero block → single ue(0) token (1 bit total)
+  m_tlast='1' on final token of each block
+
+Storage: 64 × 16-bit LUTRAM (distributed RAM, no BRAM)
+
+Resource estimate:  ~100 LUTs, ~80 FFs, 0 DSP, 0 BRAM (2 KB LUTRAM)
+
+--------------------------------------------------------------------------------
+exp_golomb.vhd — Exponential-Golomb Entropy Coder (~121 lines)
+--------------------------------------------------------------------------------
+Encodes signed/unsigned values using exp-Golomb variable-length codes.
+
+Input Modes:
+  UE mode (s_tmode='1'): Encode unsigned value directly
+  SE mode (s_tmode='0'): Map signed → unsigned via:
+                          x > 0:  v = 2|x| - 1
+                          x <= 0: v = 2|x|
+
+Exp-Golomb Codeword for value v:
+  M = floor(log2(v+1))  = MSB position of (v+1)
+  Codeword = <M zeros> 1 <M LSBs of (v+1)>  (left-aligned in 32 bits)
+  Total bits = 2M + 1 (max 31 bits for coefficient value ±32767)
+
+Output: 32-bit codeword (left-aligned) + 6-bit valid length
+Pipeline: 1-cycle registered latency
+Priority encoder: counts leading zeros to find MSB (combinatorial)
+
+Resource estimate:  ~100 LUTs, ~40 FFs, 0 DSP, 0 BRAM
+
+--------------------------------------------------------------------------------
+bs_packer.vhd — Variable-Length Bitstream Packer (~180 lines)
+--------------------------------------------------------------------------------
+Accumulates variable-length codewords and emits byte-aligned output.
+
+Accumulator:
+  128-bit shift register, valid bits left-aligned
+  Emits most-significant byte first (big-endian)
+
+Input:
+  cw_data (32-bit), cw_len (1..32 bits), cw_valid strobe
+  cw_ready backpressure ('0' when fill > 96 or downstream stalled)
+
+Output:
+  AXI-Stream byte, m_tlast on flush (end of frame)
+
+Drain Logic:
+  Emits 1 byte/clock when fill >= 8 and downstream ready
+  Flush: zero-pad remaining bits, emit final byte with m_tlast='1'
+  Byte counter increments to feed BS_BYTES register
+
+Resource estimate:  ~200 LUTs, ~160 FFs, 0 DSP, 0 BRAM
+
+--------------------------------------------------------------------------------
+recon_writer.vhd — Reconstruction Loop (~300+ lines)
+--------------------------------------------------------------------------------
+Performs the encoder reconstruction loop: dequantize → IDCT → add prediction
+→ clip → write reconstructed pixels to DDR.
+
+Pipeline:
+  1. Dequant:    deq = qcoeff × step  (1 DSP multiply, 1 cycle)
+  2. IDCT:       dct8_inv instantiated internally  (35 cycles)
+  3. Add Pred:   Three modes based on intra_mode / P-frame flag:
+                   INTRA_DC    add scalar pred_dc to all 64 pixels
+                   INTRA_HORIZ add pred_left_col[row] per row
+                   INTRA_VERT  add pred_above_row[col] per column
+                   P-frame     add MC pixels from halfpel_mc via pred_row input
+  4. Clip:       Result clipped to [0, 255]
+  5. DDR Write:  One reconstructed pixel/clock to ref_frame_ddr write port
+
+Feedback:
+  recon_row7 (8 pixels): Row 7 of reconstructed block → mb_buffer above-row
+  recon_col7 (8 pixels): Col 7 of reconstructed block → mb_buffer left-column
+
+Resource estimate:  ~500 LUTs, ~400 FFs, ~1 DSP58E2, 0 BRAM
+
+================================================================================
+4. DATA FLOW
+================================================================================
+
+  Video Input (AXI-Stream 8-bit YUV 4:2:0)
+        |
+        v
+  mb_buffer  [BRAM line buffer, intra predictor]
+        |
+        +----[I-Frame path]---------------------------+
+        |                                             |
+        v                                             |
+  dct8_fwd  (17-cycle latency)                        |
+        |                                             |
+        v                                             |
+  quant_enc  (1-cycle latency)                        |
+        |                                     [recon_writer]
+        v                                             |
+  zigzag  (64-cycle fill + emit)                      |
+        |                                             |
+        v                                             |
+  exp_golomb  (1-cycle)                               |
+        |                                             |
+        v                                             |
+  bs_packer  → Output AXI-Stream bitstream            |
+                                                      |
+        +----[P-Frame path]---------------------------+
+        |
+  Capture 8×8 current block
+        |
+        v
+  me_engine (~300 clocks: diamond + half-pel search)
+        |
+        v
+  bs_packer [inject skip flag + MV headers]
+        |
+  [if not skip]
+        |
+        v
+  halfpel_mc (3-cycle latency per row)
+        |
+  Compute residual = current − prediction
+        |
+        v
+  [Same DCT → Quant → Zigzag → Entropy → Bitstream]
+
+
+  ref_frame_ddr provides BRAM search window to me_engine + halfpel_mc
+  recon_writer writes reconstructed pixels back to ref_frame_ddr
+
+================================================================================
+5. RESOURCE UTILIZATION — ACTUAL SYNTHESIS RESULTS
+================================================================================
+
+Device: xczu3eg-sfvc784-1-e  (Zynq UltraScale+ ZU3EG)
+Tool:   Vivado v.2025.2
+Date:   2026-03-25  (post-BRAM fix + half-pixel ME removal)
+
+--- Current utilization (design fits) ---
+
+Resource                  Used      Available   Util%
+---------------------------------------------------------------------------
+CLB LUTs (total)          26457     70560        37.50%
+  LUT as Logic            25725     70560        36.46%
+  LUT as Memory             732     28800         2.54%
+    LUT as Dist. RAM        732     —                    (above-row store etc.)
+    LUT as Shift Register     0     —
+CLB Registers             11723     141120         8.31%
+  Register as Flip Flop   11723     141120         8.31%
+  Register as Latch           0     141120         0.00%
+CARRY8                     2080      8820         23.58%
+F7 Muxes                    595     35280          1.69%
+F8 Muxes                     64     17640          0.36%
+F9 Muxes                      0      8820          0.00%
+Unique Control Sets          227     17640          1.29%
+BLOCK RAM Tile             79.5       216          36.81%
+  RAMB36E2                   78       216          36.11%
+  RAMB18E2                    3       432           0.69%
+DSP48E2                     221       360          61.39%
+Bonded IOB                  350       252         138.89%  (see note)
+---------------------------------------------------------------------------
+
+I/O Note (138.89% — not a real issue):
+  enc_top has 350 ports (AXI-Stream, AXI-Lite, AXI4-HP, control signals).
+  These connect to PS8 interfaces and internal signals inside a Zynq block design,
+  not to physical I/O pins. No action required.
+
+--- Before vs after comparison ---
+
+Resource              Pre-fix (broken)   Post-fix (current)   Change
+---------------------------------------------------------------------------
+CLB LUTs total        120610  (171%)     26457   (37%)        -78%
+LUT as Memory          73548  (255%)       732    (3%)        -99%
+CLB Registers          12546   (9%)      11723    (8%)         -7%
+CARRY8                  2131  (24%)       2080   (24%)         -2%
+F7 Muxes                8855  (25%)        595    (2%)        -93%
+F8 Muxes                3648  (21%)         64    (0%)        -98%
+BRAM Tiles                 0   (0%)       79.5   (37%)       fixed
+DSP48E2                  222  (13%)        221   (61%)        same
+---------------------------------------------------------------------------
+
+Fixes applied:
+  ref_frame_ddr:  BRAM_COLS 480→512 (power-of-2 addressing) + write-mux
+                  consolidated to single source. Vivado now infers 78 RAMB36E2.
+  mb_buffer:      Read split into 3 independent processes (one per plane) with
+                  combinatorial output mux. Each lb_y/lb_cb/lb_cr infers as BRAM.
+  me_engine:      Half-pixel refinement removed. ME latency ~550→~280 clocks/block.
+                  MV output still in half-pel units (LSB=0); interface unchanged.
+
+--- Remaining headroom ---
+
+Resource        Used    Available   Free
+---------------------------------------------------------------------------
+CLB LUTs        26457   70560       44103  (63% free)
+LUT as Memory     732   28800       28068  (98% free)
+Registers       11723   141120     129397  (92% free)
+BRAM Tiles       79.5     216        136.5 (63% free)
+DSP48E2           221     360          139 (39% free)
+
+================================================================================
+6. PIPELINE LATENCY SUMMARY
+================================================================================
+
+Module            Latency (clocks @ 200 MHz)   Notes
+----------------------------------------------------------------------
+dct8_fwd          17                           Row fill + col + emit
+quant_enc         1                            Always ready
+zigzag            64 + 1 + N (N <= 64)        Depends on zero suppression
+exp_golomb        1                            Per coefficient
+bs_packer         1 (per byte emitted)        Variable bit accumulation
+dct8_inv          35                           Load + col + row passes
+recon_writer      ~100                         Includes IDCT + DDR write
+me_engine         ~300                         Diamond + half-pel search
+halfpel_mc        3                            BRAM reads + interpolate
+
+End-to-end latency (I-frame block): ~200 clocks (~1 µs at 200 MHz)
+End-to-end latency (P-frame block): ~500 clocks (~2.5 µs at 200 MHz, dominated by ME)
+
+================================================================================
+7. KEY PARAMETERS
+================================================================================
+
+Parameter           Value       Notes
+----------------------------------------------------------------------
+Macroblock size     16×16 px    Luma macroblock
+Block size          8×8 px      Luma coding unit
+Chroma block        4×4 px      4:2:0 subsampling
+Max width           3840 px     4K resolution
+Max height          2160 px     4K resolution
+QP range            1–51        Quantization parameter
+QP step base        {10,11,13,14,16,18}  Indexed by (QP-1) mod 6
+DCT coefficients    signed 32-bit        Before quantization
+Quantized coeffs    signed 16-bit        After quantization
+Residuals           signed 9-bit         Packed 8× in 72-bit word
+Motion vector       signed 7-bit         Half-pixel units (±64 range)
+ME search range     16 px                Integer pixel search window
+Skip threshold      128 SAD              Per 8×8 block
+Clock               200 MHz              Zynq UltraScale+ target
+DDR burst length    16 beats             AXI4 AWLEN/ARLEN = 15
+
+================================================================================
+8. BITSTREAM FORMAT
+================================================================================
+
+Per Frame:
+  [1 bit]  frame_type   (0 = INTRA_I, 1 = FRAME_P)
+
+Per 8×8 Luma Block (raster scan order, I-Frame):
+  [2 bits] intra_mode   (00=DC, 01=HORIZ, 10=VERT, 11=PLANAR)
+  [UE]     ue(count)    — last non-zero coefficient index + 1
+  [SE]     se(dc_diff)  — quantized DC minus previous block's DC (DPCM)
+  [(count-1) × SE]  se(ac_coeff) — AC coefficients in zigzag order
+
+Per 8×8 Luma Block (P-Frame):
+  [1 bit]  skip          (1 = skip block, 0 = coded)
+  If skip == 0:
+    [SE]   se(mv_dx)    — motion vector X in half-pel units
+    [SE]   se(mv_dy)    — motion vector Y in half-pel units
+    [UE]   ue(count)    — non-zero residual coefficient count
+    [count × SE]  se(coeff) — quantized residual coefficients
+
+Chroma Blocks (Cb then Cr):
+  Always INTRA_DC mode (no mode header)
+  Same UE count + SE coefficients structure as I-frame luma
+
+================================================================================
+9. AXI INTERFACES
+================================================================================
+
+s_axis_video (AXI-Stream Slave, 8-bit)
+  tdata[7:0]   Pixel byte (Y, Cb, Cr in sequence)
+  tvalid       Valid pixel strobe
+  tready       Backpressure
+  tlast        End of row
+  tuser        Start of frame (SOF)
+
+m_axis_bitstream (AXI-Stream Master, 8-bit)
+  tdata[7:0]   Compressed bitstream byte
+  tvalid       Valid byte
+  tready       Backpressure from downstream
+  tlast        Last byte of frame
+
+AXI-Lite Control (Slave, 32-bit)
+  6-bit address (32-bit word aligned)
+  Standard AWVALID/AWREADY/WVALID/WREADY/BVALID/BREADY channels
+  Standard ARVALID/ARREADY/RVALID/RREADY channels
+
+AXI4 HP DDR (Master, 64-bit)
+  Used for reference frame prefetch and reconstruction write-back
+  Max burst: 16 beats (AWLEN/ARLEN = 15)
+  8-byte aligned addressing
+
+================================================================================
+10. ALGORITHM NOTES
+================================================================================
+
+Forward DCT:    AAN (Arai, Agui, Nakajima) algorithm, fixed-point constants
+                scaled by 2^13. Separable row/column 2-pass decomposition.
+
+Quantization:   Division-free using precomputed reciprocal ROM.
+                Two dead-zone thresholds per QP (intra smaller than inter).
+
+Entropy Coding: Exponential-Golomb with trailing-zero suppression.
+                Differential DC coding (DPCM) for I-frame luma blocks.
+
+Motion Est:     3-stride diamond search (4→2→1) for integer-pel MV.
+                8-point half-pel refinement around best integer result.
+                Early exit with skip flag if SAD < 128.
+
+Half-Pel Interp: Bilinear (2-tap horizontal/vertical, 4-tap diagonal).
+                 Reads from circular 40-row BRAM search window.
+
+Reconstruction: Full encoder reconstruction loop (in-loop filter not implemented).
+                Feeds back reconstructed neighbors for intra prediction.
+
+Intra Prediction: DC (flat 128), Horizontal (copy left column), Vertical
+                  (copy above row). Planar mode defined but not implemented.
+
+================================================================================
+11. FILE SUMMARY
+================================================================================
+
+File                Lines    Purpose
+----------------------------------------------------------------------
+enc_top.vhd         ~650     Master encoder orchestration + FSMs
+enc_ctrl.vhd        ~220     AXI-Lite control register interface
+frame_ctrl.vhd      ~94      GOP / frame-type controller
+mb_buffer.vhd       ~400     YUV 4:2:0 line buffer + intra predictor
+dct8_fwd.vhd        ~450     Forward 8×8 DCT (AAN, pipelined)
+dct8_inv.vhd        ~350     Inverse 8×8 DCT (pipelined)
+quant_enc.vhd       ~160     Forward quantizer (reciprocal multiply)
+zigzag.vhd          ~180     Zigzag reorder + trailing-zero suppression
+exp_golomb.vhd      ~121     Exponential-Golomb entropy coder
+bs_packer.vhd       ~180     Variable-length bitstream packer
+me_engine.vhd       ~380     Motion estimator (diamond search)
+halfpel_mc.vhd      ~280     Half-pixel motion compensation
+ref_frame_ddr.vhd   ~400     DDR reference frame + BRAM search window
+recon_writer.vhd    ~300     Reconstruction: dequant → IDCT → add pred
+enc_pkg.vhd         ~159     Shared types, constants, utility functions
+
+================================================================================
+END OF ARCHITECTURE REFERENCE
+Generated: 2026-03-25
+Target Device: Xilinx UltraScale+ Zynq MPSoC (e.g., ZU7EV)
+Clock: 200 MHz
+================================================================================
