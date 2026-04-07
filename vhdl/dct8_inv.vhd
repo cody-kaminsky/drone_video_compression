@@ -3,8 +3,7 @@
 --
 -- DSP sharing strategy: all 12 multiplications live in a dedicated always-on
 -- registered process (dsp_mul).  Each sh_dsp signal has exactly ONE driver,
--- so Vivado infers exactly ONE DSP48E2 per line.  The main FSM loads dsp_a
--- in ADD phases and reads sh_dsp results two cycles later in FINAL phases.
+-- so Vivado infers exactly ONE DSP48E2 per line.
 --
 -- Interface (unchanged)
 --   Input  : one row of 8 dequantised coefficients (256-bit)
@@ -12,9 +11,15 @@
 --
 -- Timing
 --   LOAD     :  8 clocks
---   COL_PASS : 24 clocks  (3 phases × 8 columns)
---   ROW_PASS : 24 clocks  (3 phases × 8 rows)
---   Total    : 56 clocks per 8×8 block
+--   COL_PASS : 10 clocks  (pipelined: 1 col/clock, 2-cycle DSP latency)
+--   ROW_PASS : 10 clocks  (pipelined: 1 row/clock, 2-cycle DSP latency)
+--   Total    : 28 clocks per 8×8 block
+--
+-- Pipeline structure (identical for COL and ROW):
+--   Cycle 0..7 : load col/row butterfly → dsp_a + even-part DC signals
+--   Cycle 1    : pipeline DC_p <= DC  (1-cycle delay for even-part)
+--   Cycle 2..9 : FINAL fires: uses sh_dsp (2-cycle latency) + DC_p (1-cycle)
+--   Total      : 8 loads + 2 drain = 10 cycles
 --
 -- Resource estimate
 --   DSP58E2 : 12
@@ -72,45 +77,36 @@ architecture rtl of dct8_inv is
   -- -------------------------------------------------------------------------
   -- FSM
   -- -------------------------------------------------------------------------
-  type state_t  is (LOAD, COL_PASS, ROW_PASS);
-  type col_ph_t is (COL_ADD_PH, COL_MUL_PH, COL_FINAL_PH);
-  type row_ph_t is (ROW_ADD_PH, ROW_MUL_PH, ROW_FINAL_PH);
+  type state_t is (LOAD, COL_PASS, ROW_PASS);
 
-  signal state     : state_t  := LOAD;
-  signal col_phase : col_ph_t := COL_ADD_PH;
-  signal row_phase : row_ph_t := ROW_ADD_PH;
-  signal col_idx   : integer range 0 to 7 := 0;
-  signal row_idx   : integer range 0 to 7 := 0;
-  signal load_row  : integer range 0 to 7 := 0;
+  signal state    : state_t := LOAD;
+  signal load_row : integer range 0 to 7 := 0;
+
+  -- COL_PASS pipeline counters
+  signal col_load_idx  : integer range 0 to 9 := 0;
+  signal col_emit_idx  : integer range 0 to 7 := 0;
+
+  -- ROW_PASS pipeline counters
+  signal row_load_idx  : integer range 0 to 9 := 0;
+  signal row_emit_idx  : integer range 0 to 7 := 0;
 
   signal in_buf  : block32_t;
   signal col_buf : block32_t;
 
-  -- Even-part DC values (shifts only, no DSP): set in ADD_PH, used in MUL_PH
-  signal col_d0pd4 : s32_t;
-  signal col_d0md4 : s32_t;
-  signal r_d04     : s32_t;
-  signal r_d04d    : s32_t;
+  -- COL_PASS even-part DC pipeline (1-cycle delay)
+  signal col_d0pd4   : s32_t := (others => '0');
+  signal col_d0md4   : s32_t := (others => '0');
+  signal col_d0pd4_p : s32_t := (others => '0');
+  signal col_d0md4_p : s32_t := (others => '0');
 
-  -- Even-part DC values registered into MUL_PH for use in FINAL_PH
-  signal sh_e_base : s32_t;
-  signal sh_e_diff : s32_t;
+  -- ROW_PASS even-part DC (r_d04/r_d04d) + 1-cycle pipeline
+  signal r_d04        : s32_t := (others => '0');
+  signal r_d04d       : s32_t := (others => '0');
+  signal row_e_base_p : s32_t := (others => '0');
+  signal row_e_diff_p : s32_t := (others => '0');
 
   -- -------------------------------------------------------------------------
-  -- Pre-mux DSP A inputs.
-  --
-  --   dsp_a(0)  → FIX_1_175875602   z34
-  --   dsp_a(1)  → -FIX_0_899976223  d7+d1
-  --   dsp_a(2)  → -FIX_2_562915447  d5+d3
-  --   dsp_a(3)  → -FIX_1_961570560  d7+d3
-  --   dsp_a(4)  → -FIX_0_390180644  d5+d1
-  --   dsp_a(5)  → FIX_0_541196100   d2+d6
-  --   dsp_a(6)  → -FIX_1_847759065  d6
-  --   dsp_a(7)  → FIX_0_765366865   d2
-  --   dsp_a(8)  → FIX_0_298631336   d7
-  --   dsp_a(9)  → FIX_2_053119869   d5
-  --   dsp_a(10) → FIX_3_072711026   d3
-  --   dsp_a(11) → FIX_1_501321110   d1
+  -- Pre-mux DSP A inputs
   -- -------------------------------------------------------------------------
   type dsp_in_t is array(0 to 11) of s32_t;
   signal dsp_a : dsp_in_t;
@@ -118,8 +114,8 @@ architecture rtl of dct8_inv is
   -- -------------------------------------------------------------------------
   -- DSP output registers — one driver each → one DSP48E2 each.
   -- -------------------------------------------------------------------------
-  signal sh_dsp1 : int32_row_t;   -- indices 0..7 used
-  signal sh_dsp2 : int32_row_t;   -- indices 0..3 used
+  signal sh_dsp1 : int32_row_t;
+  signal sh_dsp2 : int32_row_t;
 
   signal out_row : int32_row_t;
 
@@ -158,14 +154,14 @@ begin
   begin
     if rising_edge(aclk) then
       if aresetn = '0' then
-        state     <= LOAD;
-        load_row  <= 0;
-        col_idx   <= 0;
-        row_idx   <= 0;
-        col_phase <= COL_ADD_PH;
-        row_phase <= ROW_ADD_PH;
-        m_tvalid  <= '0';
-        m_tlast   <= '0';
+        state        <= LOAD;
+        load_row     <= 0;
+        col_load_idx <= 0;
+        col_emit_idx <= 0;
+        row_load_idx <= 0;
+        row_emit_idx <= 0;
+        m_tvalid     <= '0';
+        m_tlast      <= '0';
       else
         m_tvalid <= '0';
         m_tlast  <= '0';
@@ -173,164 +169,175 @@ begin
         case state is
 
           -- ------------------------------------------------------------------
-          -- LOAD
+          -- LOAD: accept 8 rows (256-bit each), 1 per clock
           -- ------------------------------------------------------------------
           when LOAD =>
             if s_tvalid = '1' then
               in_buf(load_row) <= unpack256(s_tdata);
               if load_row = 7 then
-                load_row  <= 0;
-                col_idx   <= 0;
-                col_phase <= COL_ADD_PH;
-                state     <= COL_PASS;
+                load_row     <= 0;
+                col_load_idx <= 0;
+                col_emit_idx <= 0;
+                state        <= COL_PASS;
               else
                 load_row <= load_row + 1;
               end if;
             end if;
 
           -- ------------------------------------------------------------------
-          -- COL_PASS: 3 phases × 8 columns = 24 clocks
-          --   COL_ADD_PH  : additions → col_d0pd4/md4 + dsp_a(0..11)
-          --   COL_MUL_PH  : wait (dsp_mul fires) + register sh_e_base/sh_e_diff
-          --   COL_FINAL_PH: assemble, idescale(17) → col_buf
+          -- COL_PASS: pipelined, 10 clocks total
+          --
+          -- col_d0pd4/md4 computed alongside dsp_a load; col_d0pd4_p captures
+          -- them 1 cycle later so they align with sh_dsp at FINAL time.
+          --
+          -- Timeline:
+          --   cycle 0: butterfly col 0 → dsp_a, col_d0pd4/md4
+          --   cycle 1: butterfly col 1; col_d0pd4_p = col 0 values
+          --   cycle 2: butterfly col 2; FINAL col 0 → col_buf(:)(0)
+          --   ...
+          --   cycle 7: butterfly col 7 (last); FINAL col 5
+          --   cycle 8: drain; FINAL col 6
+          --   cycle 9: drain; FINAL col 7 → ROW_PASS
           -- ------------------------------------------------------------------
           when COL_PASS =>
 
-            case col_phase is
+            -- Stage 1 pipeline: capture even-part DC from previous cycle
+            col_d0pd4_p <= col_d0pd4;
+            col_d0md4_p <= col_d0md4;
 
-              when COL_ADD_PH =>
-                col_d0pd4 <= shift_left(in_buf(0)(col_idx) + in_buf(4)(col_idx),
-                                        IDCT_CONST_BITS);
-                col_d0md4 <= shift_left(in_buf(0)(col_idx) - in_buf(4)(col_idx),
-                                        IDCT_CONST_BITS);
-                dsp_a(0)  <= (in_buf(7)(col_idx) + in_buf(3)(col_idx))
-                           + (in_buf(5)(col_idx) + in_buf(1)(col_idx));
-                dsp_a(1)  <= in_buf(7)(col_idx) + in_buf(1)(col_idx);
-                dsp_a(2)  <= in_buf(5)(col_idx) + in_buf(3)(col_idx);
-                dsp_a(3)  <= in_buf(7)(col_idx) + in_buf(3)(col_idx);
-                dsp_a(4)  <= in_buf(5)(col_idx) + in_buf(1)(col_idx);
-                dsp_a(5)  <= in_buf(2)(col_idx) + in_buf(6)(col_idx);
-                dsp_a(6)  <= in_buf(6)(col_idx);
-                dsp_a(7)  <= in_buf(2)(col_idx);
-                dsp_a(8)  <= in_buf(7)(col_idx);
-                dsp_a(9)  <= in_buf(5)(col_idx);
-                dsp_a(10) <= in_buf(3)(col_idx);
-                dsp_a(11) <= in_buf(1)(col_idx);
-                col_phase <= COL_MUL_PH;
+            -- Load: butterfly one column per clock (cycles 0..7)
+            if col_load_idx < 8 then
+              col_d0pd4 <= shift_left(in_buf(0)(col_load_idx) + in_buf(4)(col_load_idx),
+                                      IDCT_CONST_BITS);
+              col_d0md4 <= shift_left(in_buf(0)(col_load_idx) - in_buf(4)(col_load_idx),
+                                      IDCT_CONST_BITS);
+              dsp_a(0)  <= (in_buf(7)(col_load_idx) + in_buf(3)(col_load_idx))
+                         + (in_buf(5)(col_load_idx) + in_buf(1)(col_load_idx));
+              dsp_a(1)  <= in_buf(7)(col_load_idx) + in_buf(1)(col_load_idx);
+              dsp_a(2)  <= in_buf(5)(col_load_idx) + in_buf(3)(col_load_idx);
+              dsp_a(3)  <= in_buf(7)(col_load_idx) + in_buf(3)(col_load_idx);
+              dsp_a(4)  <= in_buf(5)(col_load_idx) + in_buf(1)(col_load_idx);
+              dsp_a(5)  <= in_buf(2)(col_load_idx) + in_buf(6)(col_load_idx);
+              dsp_a(6)  <= in_buf(6)(col_load_idx);
+              dsp_a(7)  <= in_buf(2)(col_load_idx);
+              dsp_a(8)  <= in_buf(7)(col_load_idx);
+              dsp_a(9)  <= in_buf(5)(col_load_idx);
+              dsp_a(10) <= in_buf(3)(col_load_idx);
+              dsp_a(11) <= in_buf(1)(col_load_idx);
+              col_load_idx <= col_load_idx + 1;
+            end if;
 
-              when COL_MUL_PH =>
-                -- dsp_mul fires this cycle; register even-part DC shifts
-                sh_e_base <= col_d0pd4;
-                sh_e_diff <= col_d0md4;
-                col_phase <= COL_FINAL_PH;
+            -- Emit FINAL: sh_dsp ready 2 cycles after dsp_a; col_d0pd4_p ready 2 cycles after load
+            if col_load_idx >= 2 then
+              tmp2 := sh_dsp1(5) + sh_dsp1(7);
+              tmp3 := sh_dsp1(5) + sh_dsp1(6);
+              tmp0 := col_d0pd4_p + tmp2;
+              tmp1 := col_d0pd4_p - tmp2;
+              tmp2 := col_d0md4_p + tmp3;
+              tmp3 := col_d0md4_p - tmp3;
+              z5 := sh_dsp1(0);
+              z1 := sh_dsp1(1);
+              z2 := sh_dsp1(2);
+              z3 := sh_dsp1(3) + z5;
+              z4 := sh_dsp1(4) + z5;
+              col_buf(0)(col_emit_idx) <= idescale(tmp0 + sh_dsp2(3) + z1 + z4, 17);
+              col_buf(7)(col_emit_idx) <= idescale(tmp0 - sh_dsp2(3) - z1 - z4, 17);
+              col_buf(1)(col_emit_idx) <= idescale(tmp2 + sh_dsp2(2) + z2 + z3, 17);
+              col_buf(6)(col_emit_idx) <= idescale(tmp2 - sh_dsp2(2) - z2 - z3, 17);
+              col_buf(2)(col_emit_idx) <= idescale(tmp3 + sh_dsp2(1) + z2 + z4, 17);
+              col_buf(5)(col_emit_idx) <= idescale(tmp3 - sh_dsp2(1) - z2 - z4, 17);
+              col_buf(3)(col_emit_idx) <= idescale(tmp1 + sh_dsp2(0) + z1 + z3, 17);
+              col_buf(4)(col_emit_idx) <= idescale(tmp1 - sh_dsp2(0) - z1 - z3, 17);
 
-              when COL_FINAL_PH =>
+              if col_emit_idx = 7 then
+                col_load_idx <= 0;
+                col_emit_idx <= 0;
+                row_load_idx <= 0;
+                row_emit_idx <= 0;
+                state        <= ROW_PASS;
+              else
+                col_emit_idx <= col_emit_idx + 1;
+              end if;
+            end if;
+
+          -- ------------------------------------------------------------------
+          -- ROW_PASS: pipelined, 10 clocks total
+          --
+          -- r_d04/r_d04d set each cycle; row_e_base_p captures them 1 cycle
+          -- later, aligning with sh_dsp (2-cycle DSP latency).
+          --
+          -- Timeline:
+          --   cycle 0: load row 0 → dsp_a, r_d04/d
+          --   cycle 1: load row 1; row_e_base_p = row 0 e_base
+          --   cycle 2: load row 2; EMIT row 0
+          --   ...
+          --   cycle 7: load row 7; EMIT row 5
+          --   cycle 8: drain; EMIT row 6
+          --   cycle 9: drain; EMIT row 7 → LOAD
+          -- ------------------------------------------------------------------
+          when ROW_PASS =>
+
+            -- Stage 1 pipeline: even-part DC from previous cycle's r_d04
+            row_e_base_p <= shift_left(r_d04,  IDCT_CONST_BITS);
+            row_e_diff_p <= shift_left(r_d04d, IDCT_CONST_BITS);
+
+            -- Load: set dsp_a for row row_load_idx (cycles 0..7)
+            if row_load_idx < 8 then
+              r_d04  <= col_buf(row_load_idx)(0) + col_buf(row_load_idx)(4);
+              r_d04d <= col_buf(row_load_idx)(0) - col_buf(row_load_idx)(4);
+              dsp_a(0)  <= (col_buf(row_load_idx)(7) + col_buf(row_load_idx)(3))
+                         + (col_buf(row_load_idx)(5) + col_buf(row_load_idx)(1));
+              dsp_a(1)  <= col_buf(row_load_idx)(7) + col_buf(row_load_idx)(1);
+              dsp_a(2)  <= col_buf(row_load_idx)(5) + col_buf(row_load_idx)(3);
+              dsp_a(3)  <= col_buf(row_load_idx)(7) + col_buf(row_load_idx)(3);
+              dsp_a(4)  <= col_buf(row_load_idx)(5) + col_buf(row_load_idx)(1);
+              dsp_a(5)  <= col_buf(row_load_idx)(2) + col_buf(row_load_idx)(6);
+              dsp_a(6)  <= col_buf(row_load_idx)(6);
+              dsp_a(7)  <= col_buf(row_load_idx)(2);
+              dsp_a(8)  <= col_buf(row_load_idx)(7);
+              dsp_a(9)  <= col_buf(row_load_idx)(5);
+              dsp_a(10) <= col_buf(row_load_idx)(3);
+              dsp_a(11) <= col_buf(row_load_idx)(1);
+              row_load_idx <= row_load_idx + 1;
+            end if;
+
+            -- Emit: sh_dsp ready 2 cycles after dsp_a load (cycles 2..9)
+            if row_load_idx >= 2 then
+              if m_tready = '1' then
                 tmp2 := sh_dsp1(5) + sh_dsp1(7);
                 tmp3 := sh_dsp1(5) + sh_dsp1(6);
-                tmp0 := sh_e_base + tmp2;
-                tmp1 := sh_e_base - tmp2;
-                tmp2 := sh_e_diff + tmp3;
-                tmp3 := sh_e_diff - tmp3;
+                tmp0 := row_e_base_p + tmp2;
+                tmp1 := row_e_base_p - tmp2;
+                tmp2 := row_e_diff_p + tmp3;
+                tmp3 := row_e_diff_p - tmp3;
                 z5 := sh_dsp1(0);
                 z1 := sh_dsp1(1);
                 z2 := sh_dsp1(2);
                 z3 := sh_dsp1(3) + z5;
                 z4 := sh_dsp1(4) + z5;
-                col_buf(0)(col_idx) <= idescale(tmp0 + sh_dsp2(3) + z1 + z4, 17);
-                col_buf(7)(col_idx) <= idescale(tmp0 - sh_dsp2(3) - z1 - z4, 17);
-                col_buf(1)(col_idx) <= idescale(tmp2 + sh_dsp2(2) + z2 + z3, 17);
-                col_buf(6)(col_idx) <= idescale(tmp2 - sh_dsp2(2) - z2 - z3, 17);
-                col_buf(2)(col_idx) <= idescale(tmp3 + sh_dsp2(1) + z2 + z4, 17);
-                col_buf(5)(col_idx) <= idescale(tmp3 - sh_dsp2(1) - z2 - z4, 17);
-                col_buf(3)(col_idx) <= idescale(tmp1 + sh_dsp2(0) + z1 + z3, 17);
-                col_buf(4)(col_idx) <= idescale(tmp1 - sh_dsp2(0) - z1 - z3, 17);
+                o(0) := idescale(tmp0 + sh_dsp2(3) + z1 + z4, 15);
+                o(7) := idescale(tmp0 - sh_dsp2(3) - z1 - z4, 15);
+                o(1) := idescale(tmp2 + sh_dsp2(2) + z2 + z3, 15);
+                o(6) := idescale(tmp2 - sh_dsp2(2) - z2 - z3, 15);
+                o(2) := idescale(tmp3 + sh_dsp2(1) + z2 + z4, 15);
+                o(5) := idescale(tmp3 - sh_dsp2(1) - z2 - z4, 15);
+                o(3) := idescale(tmp1 + sh_dsp2(0) + z1 + z3, 15);
+                o(4) := idescale(tmp1 - sh_dsp2(0) - z1 - z3, 15);
+                out_row  <= o;
+                m_tvalid <= '1';
+                m_tlast  <= '1' when row_emit_idx = 7 else '0';
 
-                if col_idx = 7 then
-                  col_idx   <= 0;
-                  col_phase <= COL_ADD_PH;
-                  row_idx   <= 0;
-                  row_phase <= ROW_ADD_PH;
-                  state     <= ROW_PASS;
+                if row_emit_idx = 7 then
+                  row_load_idx <= 0;
+                  row_emit_idx <= 0;
+                  col_load_idx <= 0;
+                  col_emit_idx <= 0;
+                  state        <= LOAD;
                 else
-                  col_idx   <= col_idx + 1;
-                  col_phase <= COL_ADD_PH;
+                  row_emit_idx <= row_emit_idx + 1;
                 end if;
-
-            end case;
-
-          -- ------------------------------------------------------------------
-          -- ROW_PASS: 3 phases × 8 rows = 24 clocks
-          --   ROW_ADD_PH  : additions → r_d04/r_d04d + dsp_a(0..11)
-          --   ROW_MUL_PH  : wait (dsp_mul fires) + register sh_e_base/sh_e_diff
-          --   ROW_FINAL_PH: assemble, idescale(15), emit if m_tready
-          -- ------------------------------------------------------------------
-          when ROW_PASS =>
-
-            case row_phase is
-
-              when ROW_ADD_PH =>
-                r_d04  <= col_buf(row_idx)(0) + col_buf(row_idx)(4);
-                r_d04d <= col_buf(row_idx)(0) - col_buf(row_idx)(4);
-                dsp_a(0)  <= (col_buf(row_idx)(7) + col_buf(row_idx)(3))
-                           + (col_buf(row_idx)(5) + col_buf(row_idx)(1));
-                dsp_a(1)  <= col_buf(row_idx)(7) + col_buf(row_idx)(1);
-                dsp_a(2)  <= col_buf(row_idx)(5) + col_buf(row_idx)(3);
-                dsp_a(3)  <= col_buf(row_idx)(7) + col_buf(row_idx)(3);
-                dsp_a(4)  <= col_buf(row_idx)(5) + col_buf(row_idx)(1);
-                dsp_a(5)  <= col_buf(row_idx)(2) + col_buf(row_idx)(6);
-                dsp_a(6)  <= col_buf(row_idx)(6);
-                dsp_a(7)  <= col_buf(row_idx)(2);
-                dsp_a(8)  <= col_buf(row_idx)(7);
-                dsp_a(9)  <= col_buf(row_idx)(5);
-                dsp_a(10) <= col_buf(row_idx)(3);
-                dsp_a(11) <= col_buf(row_idx)(1);
-                row_phase <= ROW_MUL_PH;
-
-              when ROW_MUL_PH =>
-                -- dsp_mul fires this cycle; register even-part DC shifts
-                sh_e_base <= shift_left(r_d04,  IDCT_CONST_BITS);
-                sh_e_diff <= shift_left(r_d04d, IDCT_CONST_BITS);
-                row_phase <= ROW_FINAL_PH;
-
-              when ROW_FINAL_PH =>
-                if m_tready = '1' then
-                  tmp2 := sh_dsp1(5) + sh_dsp1(7);
-                  tmp3 := sh_dsp1(5) + sh_dsp1(6);
-                  tmp0 := sh_e_base + tmp2;
-                  tmp1 := sh_e_base - tmp2;
-                  tmp2 := sh_e_diff + tmp3;
-                  tmp3 := sh_e_diff - tmp3;
-                  z5 := sh_dsp1(0);
-                  z1 := sh_dsp1(1);
-                  z2 := sh_dsp1(2);
-                  z3 := sh_dsp1(3) + z5;
-                  z4 := sh_dsp1(4) + z5;
-                  o(0) := idescale(tmp0 + sh_dsp2(3) + z1 + z4, 15);
-                  o(7) := idescale(tmp0 - sh_dsp2(3) - z1 - z4, 15);
-                  o(1) := idescale(tmp2 + sh_dsp2(2) + z2 + z3, 15);
-                  o(6) := idescale(tmp2 - sh_dsp2(2) - z2 - z3, 15);
-                  o(2) := idescale(tmp3 + sh_dsp2(1) + z2 + z4, 15);
-                  o(5) := idescale(tmp3 - sh_dsp2(1) - z2 - z4, 15);
-                  o(3) := idescale(tmp1 + sh_dsp2(0) + z1 + z3, 15);
-                  o(4) := idescale(tmp1 - sh_dsp2(0) - z1 - z3, 15);
-                  out_row  <= o;
-                  m_tvalid <= '1';
-
-                  if row_idx = 7 then
-                    m_tlast   <= '1';
-                    row_idx   <= 0;
-                    col_idx   <= 0;
-                    col_phase <= COL_ADD_PH;
-                    row_phase <= ROW_ADD_PH;
-                    state     <= LOAD;
-                  else
-                    m_tlast   <= '0';
-                    row_idx   <= row_idx + 1;
-                    row_phase <= ROW_ADD_PH;
-                  end if;
-                end if;
-
-            end case;
+              end if;
+            end if;
 
         end case;
       end if;

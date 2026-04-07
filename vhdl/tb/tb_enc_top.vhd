@@ -195,7 +195,12 @@ architecture sim of tb_enc_top is
   end procedure;
 
   -- -------------------------------------------------------------------------
-  -- Send one byte on the video AXI-Stream
+  -- Send one byte on the video AXI-Stream at 1 cycle/pixel (streaming).
+  -- Data is presented immediately; the procedure waits for a full settled
+  -- clock edge before reading tready, avoiding the delta-cycle race against
+  -- mb_buffer's combinatorial s_tready.  tvalid is left asserted on exit
+  -- so consecutive calls have zero idle gap.
+  -- Caller must de-assert vid_tvalid after the final pixel.
   -- -------------------------------------------------------------------------
   procedure send_vid_byte (
     signal   clk    : in  std_logic;
@@ -209,16 +214,14 @@ architecture sim of tb_enc_top is
     constant user   : in  std_logic
   ) is
   begin
-    -- Wait until downstream is ready
-    wait until rising_edge(clk) and tready = '1';
     tdata  <= std_logic_vector(to_unsigned(val mod 256, 8));
     tvalid <= '1';
     tlast  <= last;
     tuser  <= user;
-    wait until rising_edge(clk);
-    tvalid <= '0';
-    tlast  <= '0';
-    tuser  <= '0';
+    wait until rising_edge(clk);        -- always wait at least one full cycle
+    while tready /= '1' loop            -- hold data until accepted
+      wait until rising_edge(clk);
+    end loop;
   end procedure;
 
 begin
@@ -497,6 +500,10 @@ begin
       send_vid_byte(aclk, vid_tdata, vid_tvalid, vid_tlast, vid_tuser,
                     vid_tready, pix, v_last, '0');
     end loop;
+
+    -- De-assert tvalid after last pixel (streaming procedure leaves it high)
+    vid_tvalid <= '0';
+    vid_tlast  <= '0';
 
     if use_file then
       file_close(yuv_f);

@@ -143,6 +143,10 @@ architecture rtl of mb_buffer is
   signal cr_strip_rdy_r    : std_logic := '0';
   signal cr_strip_pend     : integer range 0 to 7 := 0;
 
+  -- Internal readable copy of s_tready (s_tready is an 'out' port so it
+  -- cannot be read back by this architecture's own processes).
+  signal tready_i          : std_logic;
+
   -- =========================================================================
   -- Shared prefetch / row registers
   -- =========================================================================
@@ -226,11 +230,12 @@ begin
   -- y_active='1'           → luma bytes  → gate by luma strip_pend
   -- y_active='0', not cr   → Cb bytes    → gate by cb_strip_pend
   -- y_active='0', cr       → Cr bytes    → gate by cr_strip_pend
-  s_tready <= enc_enable when
+  tready_i <= enc_enable when
                 ((y_active = '1'  and strip_pend    = 0) or
                  (y_active = '0'  and chr_is_cr = '0' and cb_strip_pend = 0) or
                  (y_active = '0'  and chr_is_cr = '1' and cr_strip_pend = 0))
               else '0';
+  s_tready <= tready_i;
 
   -- =========================================================================
   -- BRAM synchronous reads (1-cycle latency)
@@ -321,7 +326,7 @@ begin
         -- -----------------------------------------------------------------
         -- Luma write: rows 0-7 (bank A) and 8-15 (bank B)
         -- -----------------------------------------------------------------
-        if s_tvalid = '1' and (y_active = '1' or s_tuser = '1') then
+        if s_tvalid = '1' and tready_i = '1' and (y_active = '1' or s_tuser = '1') then
 
           if s_tuser = '1' then
             wr_row   <= 0;  wr_waddr <= 0;  wr_phase <= 0;
@@ -393,7 +398,7 @@ begin
         -- is not lost due to the one-cycle activation delay in a separate
         -- process.
         -- -----------------------------------------------------------------
-        if s_tvalid = '1' and y_active = '0' and s_tuser = '0' then
+        if s_tvalid = '1' and tready_i = '1' and y_active = '0' and s_tuser = '0' then
           chr_active <= '1';
 
           if chr_is_cr = '0' then

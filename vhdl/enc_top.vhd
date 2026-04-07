@@ -184,18 +184,23 @@ architecture rtl of enc_top is
   signal dct_q_tready  : std_logic;
   signal dct_q_tlast   : std_logic;
 
-  -- DCT row serialiser
-  signal coeff_ser_data  : std_logic_vector(31 downto 0);
-  signal coeff_ser_valid : std_logic;
-  type ser_state_t is (SER_REQUEST, SER_CAPTURE, SER_EMIT);
-  signal ser_state       : ser_state_t := SER_REQUEST;
-  signal ser_idx         : integer range 0 to 7 := 0;
-  signal ser_row_buf     : std_logic_vector(255 downto 0);
+  -- Post-quant row buffer: captures 8-wide quant output rows
+  signal quant_out_data  : std_logic_vector(127 downto 0);  -- 8-wide quant output
+  signal quant_out_valid : std_logic;
+  type   qrow_buf_t      is array(0 to 7) of std_logic_vector(127 downto 0);
+  signal qrow_buf        : qrow_buf_t;
+  signal qrow_wr_idx     : integer range 0 to 7 := 0;
+  type   qser_st_t       is (QSER_FILL, QSER_EMIT);
+  signal qser_st         : qser_st_t := QSER_FILL;
 
-  -- quant_enc → zigzag
-  signal q_zz_tdata    : std_logic_vector(15 downto 0);
-  signal q_zz_tvalid   : std_logic;
-  signal q_zz_tready   : std_logic;
+  -- Wide path: qrow_buf → zigzag (128-bit, 8 rows)
+  signal zz_in_data      : std_logic_vector(127 downto 0);
+  signal zz_in_valid     : std_logic := '0';
+  signal zz_in_tready    : std_logic;
+  signal zz_emit_row     : integer range 0 to 7 := 0;
+  signal zz_emit_done    : std_logic := '0';
+
+  -- (Narrow path to recon_writer removed — recon_writer now fed directly from quant)
 
   -- zigzag → exp_golomb (muxed with MV SE injection)
   signal zz_eg_tdata   : std_logic_vector(15 downto 0);
@@ -241,14 +246,14 @@ architecture rtl of enc_top is
   -- recon_writer I/O
   -- -------------------------------------------------------------------------
   signal rw_blk_start  : std_logic := '0';
-  signal rw_coeff      : std_logic_vector(15 downto 0);
+  signal rw_coeff      : std_logic_vector(127 downto 0);
   signal rw_coeff_v    : std_logic;
   signal rw_pred_row   : std_logic_vector(63 downto 0);
   signal rw_pred_row_v : std_logic := '0';
   signal rw_wr_start   : std_logic;
   signal rw_wr_blk_x   : unsigned(11 downto 0);
   signal rw_wr_blk_y   : unsigned(11 downto 0);
-  signal rw_wr_pixel   : std_logic_vector(7 downto 0);
+  signal rw_wr_pixel   : std_logic_vector(63 downto 0);
   signal rw_wr_pix_v   : std_logic;
   signal rw_recon_done : std_logic;
   signal rw_row7       : std_logic_vector(63 downto 0);
@@ -526,7 +531,7 @@ begin
       aresetn     => int_resetn,
       qp          => enc_qp,
       is_intra    => (not frame_type) or is_chroma_phase,
-      coeff_in    => rw_coeff,
+      coeff_in    => rw_coeff,    -- 128-bit: 8 quantised coefficients per clock
       coeff_valid => rw_coeff_v,
       blk_start   => rw_blk_start,
       pred_dc        => mb_pred_dc,
@@ -578,54 +583,76 @@ begin
   mb_dct_tready <= dct_in_ready when (frame_type = FRAME_I or is_chroma_phase = '1')
                                 else '0';
 
-  -- tready is asserted in SER_CAPTURE so that the row is latched in the
-  -- same cycle the handshake occurs — not one cycle before (SER_REQUEST),
-  -- which caused the first output row to be consumed without being stored.
-  dct_q_tready <= '1' when ser_state = SER_CAPTURE else '0';
+  -- 8-wide quant accepts every DCT row immediately — no backpressure needed
+  dct_q_tready <= '1';
 
   -- =========================================================================
-  -- DCT row serialiser: 256-bit → 8×32-bit coefficients
+  -- Post-quant buffer + zigzag EMIT
+  --
+  -- FILL phase (8 clocks): stores 8 × 128-bit quant rows into qrow_buf.
+  --   Simultaneously, quant output is forwarded directly to recon_writer
+  --   (128-bit/row, no buffering needed for that path).
+  --
+  -- EMIT phase: Wide path → zigzag (128-bit/row, 8 clocks, gated on tready).
+  --   Returns to FILL when zigzag has accepted all 8 rows.
   -- =========================================================================
   process(aclk)
   begin
     if rising_edge(aclk) then
       if int_resetn = '0' then
-        ser_state       <= SER_CAPTURE;
-        ser_idx         <= 0;
-        coeff_ser_valid <= '0';
+        qrow_wr_idx  <= 0;
+        qser_st      <= QSER_FILL;
+        zz_in_valid  <= '0';
+        zz_in_data   <= (others => '0');
+        zz_emit_row  <= 0;
+        zz_emit_done <= '0';
       else
-        coeff_ser_valid <= '0';
-        case ser_state is
-          when SER_REQUEST =>
-            -- Unused state kept to avoid synthesis warnings; transitions
-            -- immediately to CAPTURE.
-            ser_state <= SER_CAPTURE;
-          when SER_CAPTURE =>
-            if dct_q_tvalid = '1' then
-              ser_row_buf <= dct_q_tdata;
-              ser_idx     <= 0;
-              ser_state   <= SER_EMIT;
-            end if;
-            -- else stay in SER_CAPTURE until DCT has a row ready
-          when SER_EMIT =>
-            if q_zz_tready = '1' then
-              coeff_ser_data  <= ser_row_buf(ser_idx*32+31 downto ser_idx*32);
-              coeff_ser_valid <= '1';
-              if ser_idx = 7 then
-                ser_idx   <= 0;
-                ser_state <= SER_CAPTURE;
+        zz_in_valid <= '0';
+
+        case qser_st is
+
+          -- ----------------------------------------------------------------
+          when QSER_FILL =>
+            if quant_out_valid = '1' then
+              qrow_buf(qrow_wr_idx) <= quant_out_data;
+              if qrow_wr_idx = 7 then
+                qrow_wr_idx  <= 0;
+                zz_emit_row  <= 0;
+                zz_emit_done <= '0';
+                qser_st      <= QSER_EMIT;
               else
-                ser_idx <= ser_idx + 1;
+                qrow_wr_idx <= qrow_wr_idx + 1;
               end if;
             end if;
+
+          -- ----------------------------------------------------------------
+          when QSER_EMIT =>
+            -- Wide path: emit one 128-bit row per clock to zigzag
+            if zz_emit_done = '0' then
+              if zz_in_tready = '1' then
+                zz_in_data  <= qrow_buf(zz_emit_row);
+                zz_in_valid <= '1';
+                if zz_emit_row = 7 then
+                  zz_emit_done <= '1';
+                else
+                  zz_emit_row <= zz_emit_row + 1;
+                end if;
+              end if;
+            end if;
+
+            -- Return to FILL when zigzag has accepted all 8 rows
+            if zz_emit_done = '1' then
+              qser_st <= QSER_FILL;
+            end if;
+
         end case;
       end if;
     end if;
   end process;
 
-  -- Feed quant coefficients also to recon_writer
-  rw_coeff   <= q_zz_tdata;
-  rw_coeff_v <= q_zz_tvalid;
+  -- recon_writer fed directly from quant output (128-bit rows, no buffering)
+  rw_coeff   <= quant_out_data;
+  rw_coeff_v <= quant_out_valid;
 
   -- =========================================================================
   -- DC DPCM: replace DC coefficient with delta from previous block's DC
@@ -667,11 +694,11 @@ begin
       aresetn   => int_resetn,
       qp        => enc_qp,
       is_intra  => not frame_type,
-      s_tdata   => coeff_ser_data,
-      s_tvalid  => coeff_ser_valid,
+      s_tdata   => dct_q_tdata,
+      s_tvalid  => dct_q_tvalid,
       s_tready  => open,
-      m_tdata   => q_zz_tdata,
-      m_tvalid  => q_zz_tvalid
+      m_tdata   => quant_out_data,
+      m_tvalid  => quant_out_valid
     );
 
   -- =========================================================================
@@ -681,9 +708,9 @@ begin
     port map (
       aclk      => aclk,
       aresetn   => int_resetn,
-      s_tdata   => q_zz_tdata,
-      s_tvalid  => q_zz_tvalid,
-      s_tready  => q_zz_tready,
+      s_tdata   => zz_in_data,
+      s_tvalid  => zz_in_valid,
+      s_tready  => zz_in_tready,
       m_tdata   => zz_eg_tdata,
       m_tvalid  => zz_eg_tvalid,
       m_tlast   => zz_eg_tlast,
@@ -821,7 +848,11 @@ begin
         end if;
 
         -- I-frame block mode header: inject 2-bit intra mode before ue(count)
-        if mode_hdr_pend = '1' and ftype_hdr_pend = '0' then
+        -- Gate on eg_cw_valid='0': previous block's exp-Golomb output must be
+        -- drained before injecting the header, otherwise the header fires mid-
+        -- stream while the previous block's zigzag is still emitting (possible
+        -- now that recon_done fires in ~46 cycles instead of ~156).
+        if mode_hdr_pend = '1' and ftype_hdr_pend = '0' and eg_cw_valid = '0' then
           hdr_active    <= '1';
           hdr_cw_data   <= mode_hdr_val & (29 downto 0 => '0');
           hdr_cw_len    <= to_unsigned(2, 6);
@@ -1051,5 +1082,47 @@ begin
       end if;
     end if;
   end process;
+
+  -- ===========================================================================
+  -- Simulation-only: block throughput measurement
+  -- Reports avg/min/max cycles between consecutive mb_blk_start pulses.
+  -- Stripped out by synthesis (pragma translate_off/on).
+  -- ===========================================================================
+  -- pragma translate_off
+  blk_timing : process(aclk)
+    variable blk_count    : integer := 0;
+    variable last_cycle   : integer := 0;
+    variable cycle_cnt    : integer := 0;
+    variable total_cycles : integer := 0;
+    variable min_gap      : integer := 999999;
+    variable max_gap      : integer := 0;
+    variable gap          : integer;
+  begin
+    if rising_edge(aclk) then
+      cycle_cnt := cycle_cnt + 1;
+      if mb_blk_start = '1' then
+        if blk_count > 0 then
+          gap := cycle_cnt - last_cycle;
+          total_cycles := total_cycles + gap;
+          if gap < min_gap then min_gap := gap; end if;
+          if gap > max_gap then max_gap := gap; end if;
+        end if;
+        last_cycle := cycle_cnt;
+        blk_count  := blk_count + 1;
+      end if;
+      if frame_done = '1' and blk_count > 1 then
+        report "BLK_THRU: n=" & integer'image(blk_count) &
+               "  avg=" & integer'image(total_cycles / (blk_count - 1)) &
+               "  min=" & integer'image(min_gap) &
+               "  max=" & integer'image(max_gap) & " cy/blk"
+               severity note;
+        blk_count    := 0;
+        total_cycles := 0;
+        min_gap      := 999999;
+        max_gap      := 0;
+      end if;
+    end if;
+  end process blk_timing;
+  -- pragma translate_on
 
 end architecture rtl;

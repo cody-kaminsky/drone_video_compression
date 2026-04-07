@@ -1,29 +1,28 @@
 -- =============================================================================
 -- zigzag.vhd  --  Zigzag scan reorder buffer with trailing-zero suppression
 --
--- Collects one 8×8 block of quantised coefficients (64 values arriving in
--- natural row-major order) and re-emits them in zigzag scan order.
+-- Accepts one 8-coefficient row (128-bit) per clock; fills the 64-entry buffer
+-- in 8 clocks instead of 64.  EMIT phase is unchanged: one coefficient per
+-- clock in zigzag order, gated by m_tready.
 --
 -- Trailing-zero suppression
 -- -------------------------
--- Instead of always emitting 64 values, this module:
---   1. Tracks the last non-zero zigzag position (last_nz) during FILL.
---   2. Emits ue(last_nz+1) as the first output token (UE mode, m_tmode='1').
---   3. Emits only coefficients 0..last_nz in zigzag order (SE mode, m_tmode='0').
--- An all-zero block emits a single ue(0) token (1 bit at the packer).
--- The decoder reads the count prefix first, then reads exactly that many SE
--- values; remaining coefficients default to zero.
+-- 1. FILL (8 clocks): accept rows; find last non-zero zigzag position (last_nz).
+-- 2. COUNT (1 clock):  emit ue(last_nz+1) as count prefix (UE mode).
+-- 3. EMIT (0..64 clocks): coefficients 0..last_nz in zigzag order (SE mode).
+-- An all-zero block emits a single ue(0) token.
 --
 -- Interface
 -- ---------
---   Input  : 64 quantised coefficients, one per clock (natural order, row 0..7)
+--   Input  : 8 quantised coefficients per clock (128-bit, natural row order)
+--            bits [15:0]=coeff0, [31:16]=coeff1, ..., [127:112]=coeff7
 --   Output : count prefix (UE, m_tmode='1') then 0..64 SE values (m_tmode='0')
 --            m_tlast='1' on the final token of each block
 --
 -- Resource estimate
 -- -----------------
---   LUTRAM : ~128 × 16-bit = 2 KB  (fits in distributed RAM, no BRAM needed)
---   Latency: 64 clocks (fill) + 1 (count) + 0..64 (emit) clocks/block
+--   LUTRAM : ~128 × 16-bit = 2 KB  (distributed RAM, no BRAM)
+--   Latency: 8 clocks (fill) + 1 (count) + 0..64 (emit) per block
 -- =============================================================================
 library ieee;
 use ieee.std_logic_1164.all;
@@ -35,8 +34,8 @@ entity zigzag is
     aclk     : in  std_logic;
     aresetn  : in  std_logic;
 
-    -- Input: coefficients in natural order (row-major, 64 per block)
-    s_tdata  : in  std_logic_vector(15 downto 0);  -- signed 16-bit
+    -- Input: 8 coefficients per clock (one DCT row, natural/row-major order)
+    s_tdata  : in  std_logic_vector(127 downto 0);  -- 8 × signed 16-bit
     s_tvalid : in  std_logic;
     s_tready : out std_logic;
 
@@ -83,7 +82,7 @@ architecture rtl of zigzag is
   -- FSM
   type state_t is (FILL, COUNT, EMIT);
   signal state   : state_t        := FILL;
-  signal wr_ptr  : integer range 0 to 63 := 0;
+  signal wr_ptr  : integer range 0 to 7  := 0;  -- row index (0..7)
   signal rd_ptr  : integer range 0 to 63 := 0;
   -- last non-zero zigzag index; -1 means all-zero block
   signal last_nz : integer range -1 to 63 := -1;
@@ -91,6 +90,8 @@ architecture rtl of zigzag is
 begin
 
   process(aclk)
+    variable max_nz : integer range -1 to 63;
+    variable coeff  : signed(15 downto 0);
   begin
     if rising_edge(aclk) then
       if aresetn = '0' then
@@ -110,21 +111,30 @@ begin
         case state is
 
           -- ----------------------------------------------------------------
-          -- FILL: accept 64 coefficients in natural order, track last_nz
+          -- FILL: accept one 128-bit row (8 coefficients) per clock.
+          -- Stores all 8 into buf and tracks the last non-zero zigzag index.
           -- ----------------------------------------------------------------
           when FILL =>
             s_tready <= '1';
             if s_tvalid = '1' then
-              buf(wr_ptr) <= signed(s_tdata);
+              -- Carry forward current last_nz as starting point for this row
+              max_nz := last_nz;
 
-              -- Update last non-zero in zigzag order
-              if signed(s_tdata) /= 0 then
-                if INV_ZIGZAG_LUT(wr_ptr) > last_nz then
-                  last_nz <= INV_ZIGZAG_LUT(wr_ptr);
+              for i in 0 to 7 loop
+                coeff := signed(s_tdata(i*16+15 downto i*16));
+                buf(wr_ptr * 8 + i) <= coeff;
+
+                -- Update max zigzag index among non-zero coefficients
+                if coeff /= 0 then
+                  if INV_ZIGZAG_LUT(wr_ptr * 8 + i) > max_nz then
+                    max_nz := INV_ZIGZAG_LUT(wr_ptr * 8 + i);
+                  end if;
                 end if;
-              end if;
+              end loop;
 
-              if wr_ptr = 63 then
+              last_nz <= max_nz;
+
+              if wr_ptr = 7 then
                 wr_ptr   <= 0;
                 s_tready <= '0';
                 state    <= COUNT;
@@ -135,15 +145,14 @@ begin
 
           -- ----------------------------------------------------------------
           -- COUNT: emit ue(last_nz + 1) as UE prefix
-          -- exp_golomb is always ready so no stall check needed
           -- ----------------------------------------------------------------
           when COUNT =>
             m_tdata  <= std_logic_vector(to_signed(last_nz + 1, 16));
             m_tvalid <= '1';
-            m_tmode  <= '1';   -- UE mode: downstream encodes as ue()
+            m_tmode  <= '1';   -- UE mode
 
             if last_nz < 0 then
-              -- All-zero block: count=0, this is the only token
+              -- All-zero block: single ue(0) token
               m_tlast  <= '1';
               last_nz  <= -1;
               s_tready <= '1';
@@ -162,7 +171,7 @@ begin
             if m_tready = '1' then
               m_tdata  <= std_logic_vector(buf(ZIGZAG_LUT(rd_ptr)));
               m_tvalid <= '1';
-              m_tmode  <= '0';   -- SE mode: coefficient
+              m_tmode  <= '0';   -- SE mode
               m_tlast  <= '1' when rd_ptr = last_nz else '0';
 
               if rd_ptr = last_nz then

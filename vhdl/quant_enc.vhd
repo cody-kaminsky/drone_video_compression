@@ -1,24 +1,30 @@
 -- =============================================================================
--- quant_enc.vhd  --  Forward quantiser (division-free, one coefficient/clock)
+-- quant_enc.vhd  --  Forward quantiser, 8 coefficients per clock (one DCT row)
 --
--- Translates quant_hw.c (quant_hw_tick) to synthesisable VHDL.
+-- Accepts one full 8-coefficient DCT row per clock (256-bit) and quantises
+-- all 8 values in parallel, emitting a 128-bit result on the next clock.
+-- Replaces the original single-coefficient version to remove the pre-quant
+-- DCT row serialiser bottleneck.
 --
--- Operation
--- ---------
---   output = sign(in) * max(0, floor(|in| * recip >> 16) )  if |in| >= dead_zone
+-- Operation (per coefficient)
+-- ---------------------------
+--   output = sign(in) * max(0, floor(|in| * recip >> 16))  if |in| >= dead_zone
 --   output = 0                                               otherwise
 --
---   recip = (2^16) / step  — preloaded from the QP ROM on QP change
+--   recip = floor(2^16 / step)  — from precomputed ROM, no runtime division
 --
 -- Interface
 -- ---------
---   Input  : one DCT coefficient per clock (signed 32-bit)
---   Output : one quantised coefficient per clock (signed 16-bit), 1-cycle latency
+--   Input  : 8 DCT coefficients per clock (256-bit, 8 × signed 32-bit)
+--            bits [31:0]=coeff0, [63:32]=coeff1, ..., [255:224]=coeff7
+--   Output : 8 quantised coefficients per clock (128-bit, 8 × signed 16-bit)
+--            bits [15:0]=qcoeff0, [31:16]=qcoeff1, ..., [127:112]=qcoeff7
+--   Latency: 1 clock cycle
 --
 -- Resource estimate
 -- -----------------
---   DSP58E2 : 1  (|in| × recip → 48-bit, then logical right-shift by 16)
---   LUT     : ~20 (dead-zone compare + sign mux)
+--   DSP58E2 : 8  (one 32×16 multiply per coefficient, inferred in parallel)
+--   LUT     : ~100 (dead-zone compares + sign muxes × 8)
 --   Latency : 1 clock cycle
 -- =============================================================================
 library ieee;
@@ -33,15 +39,15 @@ entity quant_enc is
 
     -- QP configuration — update between frames (latency 1 cycle)
     qp        : in  unsigned(5 downto 0);   -- 1..51
-    is_intra  : in  std_logic;              -- '1' = I-frame (larger dead-zone)
+    is_intra  : in  std_logic;              -- '1' = I-frame (smaller dead-zone)
 
-    -- Input: one coefficient from DCT pipeline
-    s_tdata   : in  std_logic_vector(31 downto 0);  -- signed 32-bit
+    -- Input: one full DCT row (8 coefficients) per clock
+    s_tdata   : in  std_logic_vector(255 downto 0);  -- 8 × signed 32-bit
     s_tvalid  : in  std_logic;
-    s_tready  : out std_logic;  -- always '1' (1-cycle combinatorial)
+    s_tready  : out std_logic;  -- always '1'
 
-    -- Output: quantised coefficient, 1-cycle delayed
-    m_tdata   : out std_logic_vector(15 downto 0);  -- signed 16-bit
+    -- Output: 8 quantised coefficients, 1-cycle delayed
+    m_tdata   : out std_logic_vector(127 downto 0);  -- 8 × signed 16-bit
     m_tvalid  : out std_logic
   );
 end entity quant_enc;
@@ -53,8 +59,8 @@ architecture rtl of quant_enc is
   -- BASE = {10,11,13,14,16,18}
   -- -------------------------------------------------------------------------
   type step_rom_t is array(1 to 51) of integer range 0 to 65535;
-
   type int6_arr_t is array(0 to 5) of integer;
+
   function build_step_rom return step_rom_t is
     constant BASE : int6_arr_t := (10, 11, 13, 14, 16, 18);
     variable rom  : step_rom_t;
@@ -65,8 +71,7 @@ architecture rtl of quant_enc is
     return rom;
   end function;
 
-  -- Precomputed reciprocals: RECIP_ROM(q) = floor(2^16 / STEP_ROM(q))
-  -- Eliminates runtime division, replacing the 32-CARRY8 critical path with a ROM lookup.
+  -- Precomputed reciprocals: floor(2^16 / step) — eliminates runtime division
   function build_recip_rom return step_rom_t is
     constant BASE : int6_arr_t := (10, 11, 13, 14, 16, 18);
     variable rom  : step_rom_t;
@@ -82,21 +87,19 @@ architecture rtl of quant_enc is
   constant STEP_ROM  : step_rom_t := build_step_rom;
   constant RECIP_ROM : step_rom_t := build_recip_rom;
 
-  -- Pre-computed per-QP values loaded into registers when QP changes
   signal step_r    : integer range 1 to 65535 := 10;
   signal recip_r   : unsigned(15 downto 0)    := x"1999";  -- 2^16 / 10
   signal dz_intra  : integer range 0 to 32767 := 4;        -- step*3/8
   signal dz_inter  : integer range 0 to 32767 := 5;        -- step/2
 
-  -- Pipeline register
   signal qp_prev   : unsigned(5 downto 0) := (others => '0');
 
 begin
 
-  s_tready <= '1';  -- always ready (1-cycle latency, no backpressure)
+  s_tready <= '1';  -- always ready, no backpressure
 
   -- -------------------------------------------------------------------------
-  -- Register process
+  -- Register process: update QP params and quantise 8 coefficients in parallel
   -- -------------------------------------------------------------------------
   process(aclk)
     variable coeff   : signed(31 downto 0);
@@ -110,15 +113,15 @@ begin
   begin
     if rising_edge(aclk) then
       if aresetn = '0' then
-        m_tdata   <= (others => '0');
-        m_tvalid  <= '0';
-        step_r    <= 10;
-        recip_r   <= x"1999";
-        dz_intra  <= 4;
-        dz_inter  <= 5;
-        qp_prev   <= (others => '0');
+        m_tdata  <= (others => '0');
+        m_tvalid <= '0';
+        step_r   <= 10;
+        recip_r  <= x"1999";
+        dz_intra <= 4;
+        dz_inter <= 5;
+        qp_prev  <= (others => '0');
       else
-        -- Update step ROM lookup when QP changes
+        -- Update step/recip/dead-zone registers when QP changes
         if qp /= qp_prev then
           qp_int   := to_integer(qp);
           if qp_int < 1  then qp_int := 1;  end if;
@@ -131,30 +134,34 @@ begin
           qp_prev  <= qp;
         end if;
 
-        -- Quantise one coefficient
         m_tvalid <= s_tvalid;
-        if s_tvalid = '1' then
-          coeff   := signed(s_tdata);
-          av      := unsigned(abs(coeff));
-          product := av * recip_r;   -- 32×16 → 48-bit
-          q_val   := to_integer(product(47 downto 16));  -- >> 16
 
+        if s_tvalid = '1' then
           if is_intra = '1' then
             dz_sel := dz_intra;
           else
             dz_sel := dz_inter;
           end if;
 
-          if to_integer(av) < dz_sel or q_val = 0 then
-            out_val := (others => '0');
-          elsif coeff >= 0 then
-            out_val := to_signed(q_val, 16);
-          else
-            out_val := to_signed(-q_val, 16);
-          end if;
+          -- Quantise all 8 coefficients in parallel (synthesises as 8 DSPs)
+          for i in 0 to 7 loop
+            coeff   := signed(s_tdata(i*32+31 downto i*32));
+            av      := unsigned(abs(coeff));
+            product := av * recip_r;            -- 32×16 → 48-bit
+            q_val   := to_integer(product(47 downto 16));  -- >> 16
 
-          m_tdata <= std_logic_vector(out_val);
+            if to_integer(av) < dz_sel or q_val = 0 then
+              out_val := (others => '0');
+            elsif coeff >= 0 then
+              out_val := to_signed(q_val, 16);
+            else
+              out_val := to_signed(-q_val, 16);
+            end if;
+
+            m_tdata(i*16+15 downto i*16) <= std_logic_vector(out_val);
+          end loop;
         end if;
+
       end if;
     end if;
   end process;
