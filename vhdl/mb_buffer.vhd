@@ -634,11 +634,16 @@ begin
             if m_tready = '1' then
               m_tvalid_r <= '0';
             end if;
-            -- Early PREFETCH overlap for VERT / DC modes (no left_col dependency).
+            -- Early PREFETCH overlap for VERT mode only (no left_col dependency,
+            -- and the subsequent block is always also VERT so no mode-transition
+            -- edge case).  DC mode is excluded: the next block after DC is
+            -- INTRA_HORIZ (first strip) or a mode-change boundary, and carrying
+            -- a partial fetch_cnt into PREFETCH in those cases caused the
+            -- occasional 1081-cycle recon_writer stall.
             -- rd_waddr and rd_fetch_row were pre-set in EMIT; fetch_cnt starts at 0.
             -- We run the same capture loop as PREFETCH so that by the time
             -- recon_done fires, some (or all) of the 8 rows are already loaded.
-            if intra_mode_r /= INTRA_HORIZ and last_blk_done = '0' then
+            if intra_mode_r = INTRA_VERT and last_blk_done = '0' then
               if fetch_cnt < 8 then
                 if fetch_cnt > 0 then
                   row_regs(fetch_cnt - 1) <= rd_data;
@@ -660,12 +665,15 @@ begin
                 fsm         <= IDLE;
               else
                 rd_blk <= rd_blk + 1;
-                if intra_mode_r /= INTRA_HORIZ then
-                  -- VERT/DC: early prefetch was running; continue from
-                  -- current fetch_cnt (rd_waddr & rd_fetch_row already set).
+                if intra_mode_r = INTRA_VERT then
+                  -- VERT: early prefetch was running in WAIT_RECON; continue
+                  -- from current fetch_cnt (rd_waddr & rd_fetch_row already set).
                   fsm <= PREFETCH;
                 else
-                  -- HORIZ: only the Step-2 single-cycle optimisation applies.
+                  -- HORIZ or DC: early prefetch was NOT running.  The BRAM has
+                  -- been reading row 0 of the next block (rd_fetch_row=0,
+                  -- rd_waddr already advanced in EMIT) throughout WAIT_RECON,
+                  -- so row 0 is in the pipeline — start PREFETCH at fetch_cnt=1.
                   rd_fetch_row <= 1;
                   fetch_cnt    <= 1;
                   fsm          <= PREFETCH;
