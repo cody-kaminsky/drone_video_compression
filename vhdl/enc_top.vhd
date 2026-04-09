@@ -1096,7 +1096,9 @@ begin
     variable total_cycles : integer := 0;
     variable min_gap      : integer := 999999;
     variable max_gap      : integer := 0;
+    variable max_gap_blk  : integer := 0;
     variable gap          : integer;
+    constant STALL_THRESH : integer := 200;
   begin
     if rising_edge(aclk) then
       cycle_cnt := cycle_cnt + 1;
@@ -1105,7 +1107,16 @@ begin
           gap := cycle_cnt - last_cycle;
           total_cycles := total_cycles + gap;
           if gap < min_gap then min_gap := gap; end if;
-          if gap > max_gap then max_gap := gap; end if;
+          if gap > max_gap then
+            max_gap     := gap;
+            max_gap_blk := blk_count;
+          end if;
+          if gap > STALL_THRESH then
+            report "BLK_STALL: blk=" & integer'image(blk_count) &
+                   "  gap=" & integer'image(gap) &
+                   "  cycle=" & integer'image(cycle_cnt)
+                   severity note;
+          end if;
         end if;
         last_cycle := cycle_cnt;
         blk_count  := blk_count + 1;
@@ -1114,12 +1125,14 @@ begin
         report "BLK_THRU: n=" & integer'image(blk_count) &
                "  avg=" & integer'image(total_cycles / (blk_count - 1)) &
                "  min=" & integer'image(min_gap) &
-               "  max=" & integer'image(max_gap) & " cy/blk"
+               "  max=" & integer'image(max_gap) &
+               "  max@blk=" & integer'image(max_gap_blk) & " cy/blk"
                severity note;
         blk_count    := 0;
         total_cycles := 0;
         min_gap      := 999999;
         max_gap      := 0;
+        max_gap_blk  := 0;
       end if;
     end if;
   end process blk_timing;
