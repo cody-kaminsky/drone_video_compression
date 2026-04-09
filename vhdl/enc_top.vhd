@@ -823,7 +823,7 @@ begin
         mv_x_pend      <= '0';
         mv_y_pend      <= '0';
         mode_hdr_pend  <= '0';
-        eg_last_latch  <= '0';
+        eg_last_latch  <= '1';  -- '1' so first block's header fires immediately
         rw_blk_start   <= '0';
         emit_row_idx   <= 0;
         cap_row        <= 0;
@@ -850,7 +850,7 @@ begin
         if frame_start = '1' then
           ftype_hdr_pend <= '1';
           mode_hdr_pend  <= '0';  -- reset at new frame
-          eg_last_latch  <= '0';
+          eg_last_latch  <= '1';  -- no previous block to wait for
         end if;
 
         -- Latch zz_eg_tlast: set when the last zigzag token for a block is
