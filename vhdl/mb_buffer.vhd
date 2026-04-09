@@ -617,6 +617,11 @@ begin
                   last_blk_done <= '1';
                 else
                   last_blk_done <= '0';
+                  -- Pre-issue BRAM read for next block: advance rd_waddr now so
+                  -- the BRAM continuously reads row 0 of the next block throughout
+                  -- WAIT_RECON.  Row 0 data arrives on PREFETCH cycle 0 (saves 1 cy).
+                  rd_waddr     <= rd_waddr + 1;
+                  rd_fetch_row <= 0;
                 end if;
                 fsm <= WAIT_RECON;
               else
@@ -636,10 +641,12 @@ begin
                 strip_y_r   <= strip_y_r + 8;
                 fsm         <= IDLE;
               else
+                -- rd_waddr was already incremented in EMIT (non-last block).
+                -- Row 0 BRAM read has been in flight throughout WAIT_RECON;
+                -- its data arrives on the first PREFETCH cycle.
                 rd_blk       <= rd_blk + 1;
-                rd_waddr     <= rd_waddr + 1;
-                rd_fetch_row <= 0;
-                fetch_cnt    <= 0;
+                rd_fetch_row <= 1;    -- pre-issue row 1; row 0 data arrives next
+                fetch_cnt    <= 1;    -- PREFETCH begins by capturing row 0
                 fsm          <= PREFETCH;
               end if;
             end if;
