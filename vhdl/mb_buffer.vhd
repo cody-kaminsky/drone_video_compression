@@ -10,13 +10,16 @@
 -- line counter — NOT from plane_sel.  plane_sel is used only to control
 -- which plane the EMIT FSM is currently reading from.
 --
--- BRAM layout  (48 rows × ROW_STRIDE words, 64 bits wide):
---   rows  0.. 7  luma  bank A
---   rows  8..15  luma  bank B
---   rows 16..23  Cb    bank A
---   rows 24..31  Cb    bank B
---   rows 32..39  Cr    bank A
---   rows 40..47  Cr    bank B
+-- BRAM layout  (72 rows × ROW_STRIDE words, 64 bits wide):
+--   rows  0.. 7  luma  bank 0
+--   rows  8..15  luma  bank 1
+--   rows 16..23  luma  bank 2
+--   rows 24..31  Cb    bank 0
+--   rows 32..39  Cb    bank 1
+--   rows 40..47  Cb    bank 2
+--   rows 48..55  Cr    bank 0
+--   rows 56..63  Cr    bank 1
+--   rows 64..71  Cr    bank 2
 --
 -- Luma intra modes (per block):
 --   first_strip=0     → INTRA_VERT  (predict from above row-7)
@@ -76,7 +79,7 @@ architecture rtl of mb_buffer is
   -- BRAM: 48 rows × ROW_STRIDE words, 64 bits
   -- =========================================================================
   constant ROW_STRIDE : integer := 512;
-  constant LB_DEPTH   : integer := 16 * ROW_STRIDE;  -- per plane (bank A + bank B = 16 rows)
+  constant LB_DEPTH   : integer := 24 * ROW_STRIDE;  -- per plane (3 banks × 8 rows = 24 rows)
 
   -- Split into three separate BRAMs so each has a single write port,
   -- allowing Vivado to infer block RAM cleanly.
@@ -89,8 +92,8 @@ architecture rtl of mb_buffer is
   attribute ram_style of lb_cb : signal is "block";
   attribute ram_style of lb_cr : signal is "block";
 
-  -- Row is now 0-15 within each plane's array (bank A = rows 0-7, bank B = rows 8-15)
-  function lb_addr(row : integer range 0 to 15;
+  -- Row is 0-23 within each plane's array (bank 0 = rows 0-7, bank 1 = 8-15, bank 2 = 16-23)
+  function lb_addr(row : integer range 0 to 23;
                    col : integer range 0 to ROW_STRIDE-1) return integer is
   begin
     return row * ROW_STRIDE + col;
@@ -113,8 +116,8 @@ architecture rtl of mb_buffer is
   signal line_cnt  : unsigned(11 downto 0)          := (others => '0');
   signal y_active      : std_logic := '0';
   signal strip_rdy     : std_logic := '0';
-  signal wr_strip_sel  : std_logic := '0';
-  signal rd_strip_sel  : std_logic := '0';
+  signal wr_strip_bank : integer range 0 to 2 := 0;
+  signal rd_strip_bank : integer range 0 to 2 := 0;
   signal strip_pend    : integer range 0 to 7 := 0;
 
   -- =========================================================================
@@ -129,8 +132,8 @@ architecture rtl of mb_buffer is
   signal cb_wr_waddr       : integer range 0 to ROW_STRIDE-1 := 0;
   signal cb_wr_phase       : integer range 0 to 7           := 0;
   signal cb_wr_buf         : std_logic_vector(63 downto 0)  := (others => '0');
-  signal cb_wr_strip_sel   : std_logic := '0';
-  signal cb_rd_strip_sel   : std_logic := '0';
+  signal cb_wr_strip_bank  : integer range 0 to 2 := 0;
+  signal cb_rd_strip_bank  : integer range 0 to 2 := 0;
   signal cb_strip_rdy_r    : std_logic := '0';
   signal cb_strip_pend     : integer range 0 to 7 := 0;
 
@@ -138,8 +141,8 @@ architecture rtl of mb_buffer is
   signal cr_wr_waddr       : integer range 0 to ROW_STRIDE-1 := 0;
   signal cr_wr_phase       : integer range 0 to 7           := 0;
   signal cr_wr_buf         : std_logic_vector(63 downto 0)  := (others => '0');
-  signal cr_wr_strip_sel   : std_logic := '0';
-  signal cr_rd_strip_sel   : std_logic := '0';
+  signal cr_wr_strip_bank  : integer range 0 to 2 := 0;
+  signal cr_rd_strip_bank  : integer range 0 to 2 := 0;
   signal cr_strip_rdy_r    : std_logic := '0';
   signal cr_strip_pend     : integer range 0 to 7 := 0;
 
@@ -155,6 +158,8 @@ architecture rtl of mb_buffer is
   signal rd_fetch_row : integer range 0 to 7           := 0;
   signal rd_waddr     : integer range 0 to ROW_STRIDE-1 := 0;
   signal fetch_cnt    : integer range 0 to 9           := 0;
+  -- Step 1 safe prefetch counter: tracks rows issued in WAIT_RECON (0 = none yet)
+  signal wp           : integer range 0 to 8           := 0;
 
   -- Separate registered outputs from each BRAM (enables block-RAM inference
   -- by giving each array a clean single-source read pattern).
@@ -230,10 +235,12 @@ begin
   -- y_active='1'           → luma bytes  → gate by luma strip_pend
   -- y_active='0', not cr   → Cb bytes    → gate by cb_strip_pend
   -- y_active='0', cr       → Cr bytes    → gate by cr_strip_pend
+  -- Triple-buffer: allow up to 2 strips pending so write side can fill next strip
+  -- while read side is still processing the current one.
   tready_i <= enc_enable when
-                ((y_active = '1'  and strip_pend    = 0) or
-                 (y_active = '0'  and chr_is_cr = '0' and cb_strip_pend = 0) or
-                 (y_active = '0'  and chr_is_cr = '1' and cr_strip_pend = 0))
+                ((y_active = '1'  and strip_pend    < 2) or
+                 (y_active = '0'  and chr_is_cr = '0' and cb_strip_pend < 2) or
+                 (y_active = '0'  and chr_is_cr = '1' and cr_strip_pend < 2))
               else '0';
   s_tready <= tready_i;
 
@@ -244,33 +251,27 @@ begin
   -- All three read every cycle; the correct output is selected by rd_sel_d1.
   -- =========================================================================
 
-  -- Luma BRAM read
+  -- Luma BRAM read (triple-buffer: bank 0/1/2 = rows 0-7/8-15/16-23)
   process(aclk)
-    variable rd_row : integer range 0 to 15;
   begin
     if rising_edge(aclk) then
-      if rd_strip_sel = '1' then rd_row := 8; else rd_row := 0; end if;
-      rd_data_y <= lb_y(lb_addr(rd_row + rd_fetch_row, rd_waddr));
+      rd_data_y <= lb_y(lb_addr(rd_strip_bank * 8 + rd_fetch_row, rd_waddr));
     end if;
   end process;
 
   -- Cb BRAM read
   process(aclk)
-    variable rd_row : integer range 0 to 15;
   begin
     if rising_edge(aclk) then
-      if cb_rd_strip_sel = '1' then rd_row := 8; else rd_row := 0; end if;
-      rd_data_cb <= lb_cb(lb_addr(rd_row + rd_fetch_row, rd_waddr));
+      rd_data_cb <= lb_cb(lb_addr(cb_rd_strip_bank * 8 + rd_fetch_row, rd_waddr));
     end if;
   end process;
 
   -- Cr BRAM read
   process(aclk)
-    variable rd_row : integer range 0 to 15;
   begin
     if rising_edge(aclk) then
-      if cr_rd_strip_sel = '1' then rd_row := 8; else rd_row := 0; end if;
-      rd_data_cr <= lb_cr(lb_addr(rd_row + rd_fetch_row, rd_waddr));
+      rd_data_cr <= lb_cr(lb_addr(cr_rd_strip_bank * 8 + rd_fetch_row, rd_waddr));
     end if;
   end process;
 
@@ -306,16 +307,16 @@ begin
         wr_row       <= 0;  wr_waddr <= 0;  wr_phase <= 0;
         line_cnt     <= (others => '0');
         y_active     <= '0';
-        strip_rdy    <= '0';
-        wr_strip_sel <= '0';
+        strip_rdy      <= '0';
+        wr_strip_bank  <= 0;
         -- Chroma write-side
         chr_active      <= '0';
         chr_is_cr       <= '0';
         chr_line_cnt    <= (others => '0');
         cb_wr_row    <= 0;  cb_wr_waddr <= 0;  cb_wr_phase <= 0;
         cr_wr_row    <= 0;  cr_wr_waddr <= 0;  cr_wr_phase <= 0;
-        cb_wr_strip_sel <= '0';
-        cr_wr_strip_sel <= '0';
+        cb_wr_strip_bank <= 0;
+        cr_wr_strip_bank <= 0;
         cb_strip_rdy_r  <= '0';
         cr_strip_rdy_r  <= '0';
       else
@@ -338,19 +339,15 @@ begin
             chr_line_cnt    <= (others => '0');
             cb_wr_row    <= 0;  cb_wr_waddr <= 0;  cb_wr_phase <= 0;
             cr_wr_row    <= 0;  cr_wr_waddr <= 0;  cr_wr_phase <= 0;
-            cb_wr_strip_sel <= '0';
-            cr_wr_strip_sel <= '0';
+            cb_wr_strip_bank <= 0;
+            cr_wr_strip_bank <= 0;
           end if;
 
           if s_tuser = '1' or line_cnt < frame_height then
             buf := wr_buf;
             buf(wr_phase*8+7 downto wr_phase*8) := s_tdata;
             if wr_phase = 7 then
-              if wr_strip_sel = '1' then
-                lb_y(lb_addr(8 + wr_row, wr_waddr)) <= buf;
-              else
-                lb_y(lb_addr(wr_row, wr_waddr)) <= buf;
-              end if;
+              lb_y(lb_addr(wr_strip_bank * 8 + wr_row, wr_waddr)) <= buf;
               wr_phase <= 0;
               if wr_waddr < ROW_STRIDE - 1 then
                 wr_waddr <= wr_waddr + 1;
@@ -368,7 +365,8 @@ begin
               if wr_row = 7 then
                 wr_row       <= 0;
                 strip_rdy    <= '1';
-                wr_strip_sel <= not wr_strip_sel;
+                if wr_strip_bank = 2 then wr_strip_bank <= 0;
+                else wr_strip_bank <= wr_strip_bank + 1; end if;
               else
                 wr_row <= wr_row + 1;
               end if;
@@ -387,8 +385,8 @@ begin
         if chroma_plane_rst = '1' then
           chr_is_cr       <= '1';
           chr_line_cnt    <= (others => '0');
-          cr_wr_row       <= 0;  cr_wr_waddr <= 0;  cr_wr_phase <= 0;
-          cr_wr_strip_sel <= '0';
+          cr_wr_row        <= 0;  cr_wr_waddr <= 0;  cr_wr_phase <= 0;
+          cr_wr_strip_bank <= 0;
         end if;
 
         -- -----------------------------------------------------------------
@@ -402,16 +400,12 @@ begin
           chr_active <= '1';
 
           if chr_is_cr = '0' then
-            -- Writing Cb → rows 16-23 (bank A) or 24-31 (bank B)
+            -- Writing Cb → rows 0-23 of lb_cb (3 banks × 8 rows)
             if chr_line_cnt < chroma_height then
               buf := cb_wr_buf;
               buf(cb_wr_phase*8+7 downto cb_wr_phase*8) := s_tdata;
               if cb_wr_phase = 7 then
-                if cb_wr_strip_sel = '1' then
-                  lb_cb(lb_addr(8 + cb_wr_row, cb_wr_waddr)) <= buf;
-                else
-                  lb_cb(lb_addr(cb_wr_row, cb_wr_waddr)) <= buf;
-                end if;
+                lb_cb(lb_addr(cb_wr_strip_bank * 8 + cb_wr_row, cb_wr_waddr)) <= buf;
                 cb_wr_phase <= 0;
                 if cb_wr_waddr < ROW_STRIDE - 1 then
                   cb_wr_waddr <= cb_wr_waddr + 1;
@@ -429,7 +423,8 @@ begin
                 if cb_wr_row = 7 then
                   cb_wr_row       <= 0;
                   cb_strip_rdy_r  <= '1';
-                  cb_wr_strip_sel <= not cb_wr_strip_sel;
+                  if cb_wr_strip_bank = 2 then cb_wr_strip_bank <= 0;
+                  else cb_wr_strip_bank <= cb_wr_strip_bank + 1; end if;
                 else
                   cb_wr_row <= cb_wr_row + 1;
                 end if;
@@ -447,11 +442,7 @@ begin
               buf := cr_wr_buf;
               buf(cr_wr_phase*8+7 downto cr_wr_phase*8) := s_tdata;
               if cr_wr_phase = 7 then
-                if cr_wr_strip_sel = '1' then
-                  lb_cr(lb_addr(8 + cr_wr_row, cr_wr_waddr)) <= buf;
-                else
-                  lb_cr(lb_addr(cr_wr_row, cr_wr_waddr)) <= buf;
-                end if;
+                lb_cr(lb_addr(cr_wr_strip_bank * 8 + cr_wr_row, cr_wr_waddr)) <= buf;
                 cr_wr_phase <= 0;
                 if cr_wr_waddr < ROW_STRIDE - 1 then
                   cr_wr_waddr <= cr_wr_waddr + 1;
@@ -469,7 +460,8 @@ begin
                 if cr_wr_row = 7 then
                   cr_wr_row       <= 0;
                   cr_strip_rdy_r  <= '1';
-                  cr_wr_strip_sel <= not cr_wr_strip_sel;
+                  if cr_wr_strip_bank = 2 then cr_wr_strip_bank <= 0;
+                  else cr_wr_strip_bank <= cr_wr_strip_bank + 1; end if;
                 else
                   cr_wr_row <= cr_wr_row + 1;
                 end if;
@@ -515,9 +507,10 @@ begin
         mb_blk_start_r <= '0';
         mb_blk_x_r     <= (others => '0');
         mb_blk_y_r     <= (others => '0');
-        rd_strip_sel    <= '0';
-        cb_rd_strip_sel <= '0';
-        cr_rd_strip_sel <= '0';
+        rd_strip_bank    <= 0;
+        cb_rd_strip_bank <= 0;
+        cr_rd_strip_bank <= 0;
+        wp              <= 0;
         chr_rd_blk      <= 0;
         last_blk_done      <= '0';
         chr_last_blk_done  <= '0';
@@ -547,7 +540,10 @@ begin
               rd_waddr     <= 0;
               rd_fetch_row <= 0;
               fetch_cnt    <= 0;
-              rd_strip_sel <= not wr_strip_sel;
+              -- Read the most recently completed bank: (wr_strip_bank - 1) mod 3
+              if wr_strip_bank = 0 then rd_strip_bank <= 2;
+              elsif wr_strip_bank = 1 then rd_strip_bank <= 0;
+              else rd_strip_bank <= 1; end if;
               left_col_pix <= x"8080808080808080";
               fsm          <= PREFETCH;
             -- Move to chroma FSM when luma done and plane_sel is chroma
@@ -617,12 +613,12 @@ begin
                   last_blk_done <= '1';
                 else
                   last_blk_done <= '0';
-                  -- Pre-issue BRAM read for next block: advance rd_waddr now so
-                  -- the BRAM continuously reads row 0 of the next block throughout
-                  -- WAIT_RECON.  Row 0 data arrives on PREFETCH cycle 0 (saves 1 cy).
+                  -- Step 2: pre-issue row 0 of next block so BRAM pipeline is warm
+                  -- when WAIT_RECON begins.  wp=0 initialises the Step 1 counter.
                   rd_waddr     <= rd_waddr + 1;
                   rd_fetch_row <= 0;
-                  fetch_cnt    <= 0;  -- reset for early-prefetch loop in WAIT_RECON
+                  fetch_cnt    <= 0;
+                  wp           <= 0;
                 end if;
                 fsm <= WAIT_RECON;
               else
@@ -634,6 +630,12 @@ begin
             if m_tready = '1' then
               m_tvalid_r <= '0';
             end if;
+            -- ---------------------------------------------------------------
+            -- Safe Step 1: overlap BRAM prefetch with IDCT/recon pipeline.
+            -- wp tracks how many extra rows have been issued beyond row 0
+            -- (which was pre-issued in EMIT by Step 2).
+            -- recon_done handler takes priority; else branch advances wp.
+            -- ---------------------------------------------------------------
             if recon_done = '1' then
               above_row_store(rd_blk) <= recon_row7;
               left_col_pix            <= recon_col7;
@@ -643,10 +645,35 @@ begin
                 fsm         <= IDLE;
               else
                 rd_blk <= rd_blk + 1;
-                -- Step-2: row 0 was pre-issued in EMIT; start PREFETCH from row 1.
-                rd_fetch_row <= 1;
-                fetch_cnt    <= 1;
-                fsm          <= PREFETCH;
+                -- Capture the last pre-fetched row that arrived this cycle.
+                -- rd_data = row (wp-1); row wp is in the BRAM pipeline.
+                if wp > 0 then
+                  row_regs(wp - 1) <= rd_data;
+                end if;
+                -- Enter PREFETCH at fetch_cnt = wp+1 so it captures the
+                -- in-flight row (wp) on its first cycle.
+                if wp < 7 then
+                  fetch_cnt    <= wp + 1;
+                  rd_fetch_row <= wp + 1;
+                else
+                  -- All 8 rows issued; PREFETCH immediately captures last row
+                  fetch_cnt    <= 8;
+                  rd_fetch_row <= 7;
+                end if;
+                fsm <= PREFETCH;
+              end if;
+            elsif last_blk_done = '0' then
+              -- Advance prefetch: issue next row, capture previous row result.
+              -- wp=0 on entry means row 0 is in-flight (issued in EMIT).
+              -- Each cycle: capture row (wp-1) from rd_data, issue row (wp+1).
+              if wp >= 1 then
+                row_regs(wp - 1) <= rd_data;  -- row (wp-1) arrived this cycle
+              end if;
+              if wp < 7 then
+                rd_fetch_row <= wp + 1;
+                wp           <= wp + 1;
+              elsif wp = 7 then
+                wp <= 8;  -- row 7 issued; stop advancing but allow last capture
               end if;
             end if;
 
@@ -662,7 +689,9 @@ begin
               else
                 cb_strip_pend <= cb_strip_pend - 1;
               end if;
-              cb_rd_strip_sel <= not cb_wr_strip_sel;
+              if cb_wr_strip_bank = 0 then cb_rd_strip_bank <= 2;
+              elsif cb_wr_strip_bank = 1 then cb_rd_strip_bank <= 0;
+              else cb_rd_strip_bank <= 1; end if;
               chr_rd_blk   <= 0;
               rd_waddr     <= 0;
               rd_fetch_row <= 0;
@@ -674,7 +703,9 @@ begin
               else
                 cr_strip_pend <= cr_strip_pend - 1;
               end if;
-              cr_rd_strip_sel <= not cr_wr_strip_sel;
+              if cr_wr_strip_bank = 0 then cr_rd_strip_bank <= 2;
+              elsif cr_wr_strip_bank = 1 then cr_rd_strip_bank <= 0;
+              else cr_rd_strip_bank <= 1; end if;
               chr_rd_blk   <= 0;
               rd_waddr     <= 0;
               rd_fetch_row <= 0;
