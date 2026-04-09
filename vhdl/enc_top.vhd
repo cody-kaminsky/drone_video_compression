@@ -298,10 +298,6 @@ architecture rtl of enc_top is
   -- Count skip blocks (they don't produce zigzag tlast)
   signal skip_block_cnt : integer range 0 to 32767 := 0;
 
-  -- Registered latch: captures zz_eg_tlast to give deterministic completion
-  -- detection for mode-header injection (replaces eg_cw_valid polling).
-  signal eg_last_latch  : std_logic := '0';
-
   -- -------------------------------------------------------------------------
   -- P-frame residual emission to DCT
   -- -------------------------------------------------------------------------
@@ -823,7 +819,6 @@ begin
         mv_x_pend      <= '0';
         mv_y_pend      <= '0';
         mode_hdr_pend  <= '0';
-        eg_last_latch  <= '1';  -- '1' so first block's header fires immediately
         rw_blk_start   <= '0';
         emit_row_idx   <= 0;
         cap_row        <= 0;
@@ -850,24 +845,14 @@ begin
         if frame_start = '1' then
           ftype_hdr_pend <= '1';
           mode_hdr_pend  <= '0';  -- reset at new frame
-          eg_last_latch  <= '1';  -- no previous block to wait for
         end if;
 
-        -- Track zigzag stream boundaries: eg_last_latch follows zz_eg_tlast
-        -- so it is '1' between blocks (after the last token) and '0' during
-        -- a block (after the first non-last token).  This prevents the mode
-        -- header from firing mid-block when eg_cw_valid briefly goes '0'
-        -- between tokens, without creating a cross-block stall.
-        if zz_eg_tvalid = '1' and zz_eg_tready = '1' then
-          eg_last_latch <= zz_eg_tlast;
-        end if;
-
-        -- I-frame block mode header: inject 2-bit intra mode before ue(count).
-        -- eg_last_latch='1' guarantees we are between blocks (previous block's
-        -- zigzag stream is complete); eg_cw_valid='0' confirms the last
-        -- codeword has been accepted by bs_packer.
-        if mode_hdr_pend = '1' and ftype_hdr_pend = '0'
-           and eg_cw_valid = '0' and eg_last_latch = '1' then
+        -- I-frame block mode header: inject 2-bit intra mode before ue(count)
+        -- Gate on eg_cw_valid='0': previous block's exp-Golomb output must be
+        -- drained before injecting the header, otherwise the header fires mid-
+        -- stream while the previous block's zigzag is still emitting (possible
+        -- now that recon_done fires in ~46 cycles instead of ~156).
+        if mode_hdr_pend = '1' and ftype_hdr_pend = '0' and eg_cw_valid = '0' then
           hdr_active    <= '1';
           hdr_cw_data   <= mode_hdr_val & (29 downto 0 => '0');
           hdr_cw_len    <= to_unsigned(2, 6);
