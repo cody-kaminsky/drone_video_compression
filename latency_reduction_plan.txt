@@ -1,0 +1,381 @@
+================================================================================
+LATENCY REDUCTION PLAN: 50ms → <10ms (1080p I-frame)
+================================================================================
+
+TARGET DEVICE : Zynq UltraScale+ ZU3EG, 200 MHz
+CURRENT       : ~50ms for 1080p I-frame only
+GOAL          : <10ms for 1080p I-frame
+CONSTRAINT    : No added parallel instances, no clock increase
+
+================================================================================
+CORRECTED TIMING ANALYSIS (post-measurement, Changes 1-3 complete)
+================================================================================
+
+Measured after Changes 1+2+3: 12.5ms for 1024×768
+  → 12.5ms × 200MHz / 18,432 blocks = 135.7 cycles/block (≈ 136)
+
+Actual DCT/IDCT timing (verified from code inspection):
+
+  dct8_fwd (DSP-shared 3-phase butterfly):
+    FILL:     32 cycles   (4 pipeline stages × 8 input rows)
+    COL_PASS: 24 cycles   (3 phases/col × 8 cols, serial)
+    EMIT:      8 cycles   (one row/clock)
+    TOTAL:    64 cycles   [plan originally assumed 17 — was badly wrong]
+
+  dct8_inv (same DSP-sharing strategy):
+    LOAD:      8 cycles   (one row/clock)
+    COL_PASS: 24 cycles   (3 phases/col × 8 cols, serial)
+    ROW_PASS: 24 cycles   (3 phases/row × 8 rows, serial)
+    TOTAL:    56 cycles   [plan originally assumed 35 — was wrong]
+
+Critical path after Changes 1-3 (non-pipelined stages):
+  DCT_FILL(32) + DCT_COL(24) + DCT_EMIT/IDCT_LOAD(8)
+  + IDCT_COL(24) + IDCT_ROW_PASS(24) → ~112 core cycles
+  + quant latency(1) + eg_cw_valid gate overhead(~20) ≈ 136 cycles/block
+
+1080p projection (all 7 changes not yet done):
+  136 cycles × 48,480 blocks / 200 MHz = 32.9ms   (target: <10ms)
+
+Original plan estimates were too optimistic because:
+  - DCT FILL (32 cycles) was entirely missed
+  - COL_PASS was assumed to take ~1 cycle; actual is 24 (3-phase serial)
+  - IDCT COL_PASS was similarly underestimated
+
+================================================================================
+CHANGES REQUIRED (7 changes total, ordered by implementation sequence)
+================================================================================
+
+--------------------------------------------------------------------------------
+CHANGE 1 — Remove DCT Coefficient Serializer + Widen Quantizer to 8-Wide
+           STATUS: COMPLETE
+           Measured savings: confirmed structural (combined with 2+3 in measurement)
+--------------------------------------------------------------------------------
+Files: enc_top.vhd, quant_enc.vhd
+
+Problem:
+  The serializer converted each 256-bit DCT output row into 8 sequential 32-bit
+  words: 1 capture + 8 emit = 9 cycles/row × 8 rows = 72 cycles of stall.
+
+Fix:
+  - Removed ser_state, ser_row_buf, ser_idx signals from enc_top.vhd
+  - Replaced single-coefficient quant_enc with 8-wide version (256-bit in,
+    128-bit out), 1-cycle latency, 8 parallel DSPs
+  - DCT output feeds quantizer directly; dct_q_tready = '1' permanently
+
+Result: Serializer overhead eliminated; quant latency = 1 cycle (was 72)
+
+--------------------------------------------------------------------------------
+CHANGE 2 — Widen Zigzag Fill to 8 Coefficients Per Clock
+           STATUS: COMPLETE
+           Measured savings: confirmed (combined measurement)
+--------------------------------------------------------------------------------
+File: zigzag.vhd
+
+Problem:
+  FILL state accepted 1 coefficient/clock → 64 clocks to fill buffer.
+
+Fix:
+  - Changed s_tdata from 16-bit to 128-bit (8×16-bit per clock)
+  - Fills 8 buf entries/clock; wr_ptr is row index 0..7; fill = 8 clocks
+  - INV_ZIGZAG_LUT evaluated for all 8 positions in parallel per clock
+
+Result: FILL phase = 8 cycles (was 64); EMIT unchanged (1 coeff/clock)
+
+--------------------------------------------------------------------------------
+CHANGE 3 — Widen Recon Dequant + Pixel Output to 8 Per Clock
+           STATUS: COMPLETE
+           Measured result: 12.5ms for 1024×768 (136 cycles/block)
+--------------------------------------------------------------------------------
+Files: recon_writer.vhd, ref_frame_ddr.vhd, enc_top.vhd
+
+Problem:
+  (a) Dequant accepted 1 coeff/clock → 64 cycle fill
+  (b) Pixel output sequential (pix_col 0→7) → 8 cycles/row × 8 rows = 64 cycles
+  (c) ref_frame_ddr accumulated 8 pixels from 8 separate writes
+
+Fix:
+  - coeff_in widened to 128-bit; dequant 8 values/clock; idct_v every coeff_valid
+  - wr_pixel widened to 64-bit; output 8 pixels/clock; out_row increments 1/clock
+  - ref_frame_ddr: single 64-bit write per row (was 8 × 8-bit writes)
+  - enc_top: narrow serializer path removed; quant feeds recon_writer directly
+
+Result: Dequant fill = 8 cycles (was 64); pixel output = 8 cycles (was 64)
+
+--------------------------------------------------------------------------------
+CHANGE 4 — Pipeline IDCT Row Pass to 1-Row/Clock Throughput
+           STATUS: PENDING
+           Estimated savings: ~14 cycles/block
+--------------------------------------------------------------------------------
+File: dct8_inv.vhd
+
+Problem:
+  ROW_PASS processes one row per 3 cycles (ADD_PH → MUL_PH → FINAL_PH) using
+  the shared DSP scheme. 3 cycles/row × 8 rows = 24 cycles.
+  This is the cheapest change because the row pass already has separate FFs
+  from the column pass — adding pipeline registers is low-risk.
+
+Fix:
+  - Add 2 pipeline register stages to the row butterfly
+  - Rows 0..7 enter at 1/clock; pipeline drains after row 7 + 2 extra cycles
+  - ROW_PASS latency: 8 + 2 = 10 cycles (was 24)
+  - Requires ~800 FFs for intermediate pipeline stages (negligible)
+  Note: column pass still takes 24 cycles — addressed in Change 7
+
+Result:
+  IDCT total = 8(LOAD) + 24(COL) + 10(ROW) = 42 cycles  (was 56)
+  Per-block: ~136 - 14 = 122 cycles → 1080p: ~29.6ms
+
+--------------------------------------------------------------------------------
+CHANGE 5 — Pipeline DCT Fill Stages to 1-Row/Clock Throughput
+           STATUS: PENDING
+           Estimated savings: ~20 cycles/block
+--------------------------------------------------------------------------------
+File: dct8_fwd.vhd
+
+Problem:
+  FILL takes 32 cycles: each input row passes through 4 sequential pipeline
+  stages (involving the shared DSP add/shift structure). This stalls the
+  column pass from starting until all 8 rows have been processed.
+
+  Root cause: the DSP-sharing structure serializes the 4 stages per row, so
+  each row takes 4 cycles to pass through FILL, giving 4 × 8 = 32 cycles.
+
+Fix:
+  - Re-structure FILL so each input row is accepted every clock cycle
+  - Pipeline the 4 internal stages so row N+1 enters while row N is still
+    processing (shift register of partial results, one row/clock throughput)
+  - After all 8 rows, the last row's result drains in 3 more cycles → FILL done
+  - FILL duration: 8 input rows + 3 drain = 11 cycles  (was 32)
+
+  This is independent of whether DSPs or LUTs are used — just requires adding
+  pipeline register stages between FILL processing steps.
+
+Result:
+  DCT total = 11(FILL) + 24(COL) + 8(EMIT) = 43 cycles  (was 64)
+  Per-block: ~122 - 21 = 101 cycles → 1080p: ~24.5ms
+
+--------------------------------------------------------------------------------
+CHANGE 6 — Pipeline DCT Column Pass to 1-Column/Clock Throughput
+           STATUS: PENDING
+           Estimated savings: ~16 cycles/block
+--------------------------------------------------------------------------------
+File: dct8_fwd.vhd
+
+Problem:
+  COL_PASS processes each column in 3 phases (COL_ADD_PH → COL_MUL_PH →
+  COL_FINAL_PH) reusing the same 12 DSPs. This forces 3 cycles/column ×
+  8 columns = 24 cycles total.
+
+Fix (option A — pipeline with DSPs):
+  - Add pipeline registers between phases so column N+1 starts 1 cycle after N
+  - 3-stage pipeline: col 0 starts at t=0; col 7 starts at t=7; last result
+    exits at t=7+2=9 → COL_PASS = 10 cycles  (was 24)
+  - Requires 3 sets of 12 DSPs (or careful re-use with deeper pipeline)
+    → Cost: ~24 additional DSPs (139 - 8 quant DSPs = 131 free; 131 - 24 = 107)
+
+Fix (option B — LUT-based parallel butterfly, see Change 8 note):
+  - Replace 3-phase DSP butterfly with LUT-inferred parallel multiplications
+  - All 12 multiplications per column done in 1 clock cycle (no sharing)
+  - COL_PASS = 8 cycles (1 per column, each fully parallel)
+  - Higher LUT cost but eliminates serial 3-phase dependency entirely
+
+Using option A (pipelined DSP, lower risk):
+Result:
+  DCT total = 11(FILL) + 10(COL) + 8(EMIT) = 29 cycles  (was 43 after Change 5)
+  Per-block: ~101 - 14 = 87 cycles → 1080p: ~21.1ms
+
+--------------------------------------------------------------------------------
+CHANGE 7 — Pipeline IDCT Column Pass to 1-Column/Clock Throughput
+           STATUS: PENDING
+           Estimated savings: ~14 cycles/block
+--------------------------------------------------------------------------------
+File: dct8_inv.vhd
+
+Problem:
+  Same 3-phase serial structure as DCT column pass: 24 cycles.
+  IDCT has two passes (COL then ROW); Change 4 addressed ROW_PASS.
+
+Fix: Same pipeline approach as Change 6.
+  - Pipeline COL_PASS: 3-stage, 1 column/clock throughput = 10 cycles
+
+Result:
+  IDCT total = 8(LOAD) + 10(COL) + 10(ROW) = 28 cycles  (was 42 after Change 4)
+  Per-block: ~87 - 14 = 73 cycles → 1080p: ~17.7ms
+
+================================================================================
+REVISED CRITICAL PATH (all 7 changes applied)
+================================================================================
+
+  t= 0..10   DCT FILL: 8 rows in, drains in 11 cycles (pipelined 4-stage fill)
+  t=11..20   DCT COL_PASS: 8 cols, pipelined, 10 cycles
+  t=21..28   DCT EMIT: 8 rows out (1/clock); quant 1-cycle delay
+  t=22..29   Quant output → IDCT LOAD (8 rows at 1/clock)
+  t=30..39   IDCT COL_PASS: pipelined, 10 cycles
+  t=40..49   IDCT ROW_PASS: pipelined, 10 cycles
+  t=41..49   Recon output: 1 row/clock × 8 rows (overlaps IDCT ROW_PASS)
+  t=50        recon_done → next block can start
+  + eg_cw_valid gate overhead: ~20 cycles for average block
+
+  Per-block: ~70 cycles (recon path) + ~20 cycles (entropy overhead) = ~73
+
+  Total 1080p I-frame: 73 × 48,480 / 200 MHz = 17.7ms
+
+================================================================================
+SHORTFALL ANALYSIS: 17.7ms vs 10ms TARGET
+================================================================================
+
+Even with all 7 pipeline changes, the estimated 17.7ms is still 1.77× above
+the 10ms target. Remaining bottlenecks after Changes 1-7:
+
+  1. Entropy serialization overhead (eg_cw_valid gate):
+     - Each block's mode header must wait for previous block's exp_golomb to
+       drain. For a dense block (64 nonzero coeffs), zigzag emits 73 tokens;
+       exp_golomb adds 1 cycle → header waits ~20 cycles after recon_done.
+     - Eliminating this requires pipelining the header injection or using a
+       separate header queue that doesn't gate on eg_cw_valid.
+     - Potential savings: ~15 cycles/block → 58 cycles → 14ms
+
+  2. DCT FILL pipelining assumption:
+     - 11-cycle estimate for FILL assumes clean 1-row/clock throughput through
+       all 4 internal stages. Actual saving depends on dct8_fwd internals.
+     - If the shared DSP structure prevents row-level pipelining, may need LUT
+       butterfly (see note below).
+
+  3. LUT butterfly approach (potential Change 8):
+     - Replace DSP-shared 3-phase butterfly in both dct8_fwd and dct8_inv with
+       fully parallel LUT-inferred multiplications.
+     - Per-column cost: 12 multiplications × ~3 LUT6 each (18×25-bit → 43-bit
+       truncated to 32-bit) = ~36 LUT6 per column, 288 LUT6 total per DCT.
+       Two DCTs (fwd + inv) = ~576 LUT6 — well within 44K free.
+     - Benefit: each column/row butterfly completes in 1 clock (no 3-phase
+       serialization), reducing COL_PASS from 24 to 8 cycles (1/col × 8 cols).
+     - Also enables pipelined FILL (no DSP sharing conflict) → FILL = 8 cycles.
+     - Revised estimate with LUT butterfly:
+         DCT: 8(FILL) + 8(COL) + 8(EMIT) = 24 cycles
+         IDCT: 8(LOAD) + 8(COL) + 8(ROW) = 24 cycles
+         Recon: 8 cycles (overlaps IDCT ROW)
+         Total: ~50 cycles + ~15 entropy overhead = ~65 cycles/block
+         1080p: 65 × 48,480 / 200 MHz = 15.8ms
+     - Still above 10ms — entropy overhead is now the dominant term.
+
+  4. To reach 10ms: need ≤41.3 cycles/block
+     - Requires ~20-cycle blocks after entropy overhead is solved
+     - May require inter-block DCT pipelining (block N+1 fill while block N
+       is in col pass) — fundamental re-architecture of enc_top flow control
+     - Or: increase clock frequency beyond 200 MHz (requires retiming analysis)
+
+================================================================================
+RESOURCE COST
+================================================================================
+
+  Change              Added Resources
+  ----------------------------------------------------------
+  1. 8-wide quant     +8 DSP58E2  (139 free → 131 free)
+  2. Wide zigzag      minimal LUTs
+  3. Wide recon       minimal LUTs
+  4. IDCT ROW pipe    ~800 FFs
+  5. DCT FILL pipe    ~500 FFs
+  6. DCT COL pipe     ~24 DSP58E2 + ~400 FFs  (131 → 107 free)
+  7. IDCT COL pipe    ~24 DSP58E2 + ~400 FFs  (107 → 83 free)
+  ----------------------------------------------------------
+  DSP budget after all changes: ~83 free  (started at 139)
+  Alt: LUT butterfly eliminates DSP changes 6+7, uses ~576 LUT6 instead
+
+================================================================================
+IMPLEMENTATION ORDER
+================================================================================
+
+  DONE:
+  1. Change 1: Remove serializer, 8-wide quant_enc
+  2. Change 2: Widen zigzag fill to 128-bit
+  3. Change 3: Widen recon dequant + pixel output (64-bit)
+  4. Change 4: Pipeline dct8_inv ROW_PASS (10 cycles, was 24)
+  5. Change 5: Pipeline dct8_fwd FILL (10 cycles, was 32)
+  6. Change 6: Pipeline dct8_fwd COL_PASS (10 cycles, was 24)
+  7. Change 7: Pipeline dct8_inv COL_PASS (10 cycles, was 24)
+
+  Pipeline technique (Changes 4-7):
+     → Load 1 row/col per clock; FINAL fires 2 cycles later (2-cycle DSP latency)
+     → 1-cycle pipeline register (pass_r0_p / col_d0pd4_p / row_e_base_p) aligns
+       even-part DC with sh_dsp — no extra wait state needed
+     → 8 loads + 2 drain = 10 cycles per pass
+     → dct8_fwd: FILL+COL both pipelined in same file; s_tready gated on fill_load_idx<8
+     → dct8_inv: COL+ROW both pipelined; shared dsp_a works since states are sequential
+
+  NEXT:
+  → Run simulation to verify output quality matches pre-change golden reference
+  → Measure cycle count: expect ~50-60 cycles/block (was 136)
+  → Assess entropy overhead: if still >10ms, redesign mode header injection
+
+  Simulate and measure after each change before proceeding.
+
+================================================================================
+SUMMARY TABLE
+================================================================================
+
+  Change                     Files                  Savings        Est. Total
+  --------------------------------------------------------------------------
+  Baseline (original)        -                       -             ~200 cy/blk
+  1. Remove serializer       enc_top + quant_enc     ~64 cycles    ~136 cy/blk  ✓ DONE
+  2. 8-wide zigzag           zigzag                  (in 136)      ~136 cy/blk  ✓ DONE
+  3. 8-wide recon            recon_writer+rf_ddr     (in 136)      ~136 cy/blk  ✓ DONE
+     [Measured: 12.5ms / 1024×768 = 136 cycles/block = 32.9ms projected 1080p]
+  4. IDCT ROW pipe (10 cy)   dct8_inv                ~14 cycles    ~122 cy/blk  ✓ DONE
+  5. DCT FILL pipe (10 cy)   dct8_fwd                ~22 cycles    ~100 cy/blk  ✓ DONE
+  6. DCT COL pipe (10 cy)    dct8_fwd                ~14 cycles     ~86 cy/blk  ✓ DONE
+  7. IDCT COL pipe (10 cy)   dct8_inv                ~14 cycles     ~72 cy/blk  ✓ DONE
+  --------------------------------------------------------------------------
+  DCT new: 10(FILL) + 10(COL) + 8(EMIT) = 28 cycles  (was 64)
+  IDCT new: 8(LOAD) + 10(COL) + 10(ROW) = 28 cycles  (was 56)
+  Recon: 8 cycles (overlaps IDCT ROW last 8 cycles)
+
+  Core path: DCT(28) + IDCT(28) - overlap(8) = ~50 cycles
+  + entropy overhead (eg_cw_valid gate): ~20 cycles average → ~70 cy/blk
+  Projected 1080p: 70 × 48,480 / 200 MHz ≈ 17.0ms
+
+  [Measured after all 7 changes: 11.82ms / 1024×768 = 128 cycles/block]
+
+  *** POST-MEASUREMENT FINDING: TESTBENCH IS THE BOTTLENECK ***
+
+  The 128 cycles/block figure is NOT the encoder's processing limit.
+  It is exactly: 64 pixels/block × 2 cycles/pixel = 128 cycles/block.
+
+  Root cause: tb_enc_top.vhd send_vid_byte() de-asserts tvalid after every
+  single pixel (1 cycle valid, 1 cycle idle per pixel). This creates an
+  artificial 2-cycle-per-pixel input rate.
+
+  Verification:
+    1,179,648 total pixels (1024×768 YUV 4:2:0) × 2 cycles/pixel
+    = 2,359,296 cycles = 11.80ms  ← matches measured 11.82ms exactly
+
+  Why Changes 4-7 barely helped (0.70ms total instead of ~50 cycles expected):
+    After Change 3, processing dropped to ~136 cycles/block (still above the
+    128-cycle input rate). Changes 4-7 reduced processing to match the input
+    rate (128 cy), closing a ~8-cycle gap. Once processing = input, no further
+    improvement is possible without fixing the input rate.
+
+  TESTBENCH FIX (applied):
+    send_vid_byte() rewritten to hold tvalid='1' between consecutive pixels
+    (no idle cycle between pixels). tvalid de-asserted only after the last pixel.
+    Expected result: ~1 cycle/pixel → 64 cycles/block (input-limited).
+
+  EXPECTED AFTER TESTBENCH FIX:
+    1024×768: 1,179,648 cycles = 5.9ms  (was 11.82ms)
+    1080p:    3,110,400 cycles = 15.6ms (still above 10ms — input rate wall)
+
+  TO REACH 10ms FOR 1080p:
+    The pixel count for 1080p YUV 4:2:0 is 3,110,400. At 1 pixel/clock on a
+    200 MHz bus, that alone requires 15.6ms. The only path under 10ms is a
+    2-pixel-wide input (16-bit s_axis_video_tdata → 7.8ms).
+
+    Alternatively: luma-only encoding (no chroma) = 2,073,600 pixels = 10.4ms.
+    Still borderline — needs 2-pixel input or small architectural savings.
+
+  PROCESSING LIMIT (actual, after all 7 changes):
+    With testbench fixed, the true processing bottleneck is ~51-64 cycles/block:
+      - Processing: ~51 cycles (IDCT recon_done fires at T=50)
+      - Input: 64 cycles/block (64 pixels × 1 cycle/pixel)
+      - Bottleneck: input rate at 64 cycles/block
+    1080p at 64 cy/blk: 15.5ms — same as above, dominated by pixel input
+
+================================================================================

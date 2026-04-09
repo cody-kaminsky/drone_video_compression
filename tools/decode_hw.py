@@ -8,14 +8,17 @@ Bitstream format (produced by enc_top.vhd)
     [1 bit] frame_type  (0=I-frame, 1=P-frame)
     Per 8x8 luma block in raster order (left-to-right, strip-major):
       I-frame block:
+        2-bit intra_mode (0=DC, 1=HORIZ, 2=VERT)
         ue(count) + count * se(coeff)   -- residual in zigzag order
       P-frame block:
         skip(1 bit)
         if skip == 0:
           se(mv_dx) + se(mv_dy)         -- motion vector, half-pixel units
           ue(count) + count * se(coeff) -- residual in zigzag order
-
-  Chroma (Cb/Cr): not encoded; decoder writes 128 for both planes.
+    Per 8x8 Cb block (W/2 × H/2, I-frame only):
+        2-bit intra_mode (always 0=DC, predictor=128)
+        ue(count) + count * se(coeff)
+    Per 8x8 Cr block (same format as Cb)
 
 Usage:
   python decode_hw.py <bs_out.bin> <output.yuv> <width> <height> <qp> [<gop_size>]
@@ -326,6 +329,11 @@ def main():
     blk_cols = W // 8
     blk_rows = H // 8
     n_blocks = blk_cols * blk_rows
+    cW = W // 2
+    cH = H // 2
+    chr_blk_cols = cW // 8
+    chr_blk_rows = cH // 8
+    n_chr_blocks = chr_blk_cols * chr_blk_rows
 
     print(f"Decoding {bs_path}  {W}x{H}  QP={QP}  step={step}  GOP={gop_size}")
 
@@ -352,6 +360,8 @@ def main():
         print(f"  Frame {frame_idx}: {ftype_str}-frame")
 
         Y  = [[128]*W for _ in range(H)]
+        Cb = [[128]*cW for _ in range(cH)]
+        Cr = [[128]*cW for _ in range(cH)]
 
         # Intra predictor state (I-frame): per-pixel row-7 and col-7
         # above_store[bx] = 8 pixels of reconstructed row-7 from block above
@@ -387,7 +397,7 @@ def main():
                             Y[py + r][px + c] = max(0, min(255,
                                 resid[r][c] + pred[r][c]))
             else:
-                # ---- I-frame block ----
+                # ---- I-frame luma block ----
                 if bx == 0:
                     left_col_pix = [128]*8
 
@@ -411,12 +421,35 @@ def main():
                 above_store[bx] = [Y[py + 7][px + c] for c in range(8)]
                 left_col_pix    = [Y[py + r][px + 7] for r in range(8)]
 
+        # ---- Chroma blocks (I-frame only; always INTRA_DC, predictor=128) ----
+        if not is_p:
+            prev_dc = 0
+            for plane, plane_buf in [('Cb', Cb), ('Cr', Cr)]:
+                prev_dc = 0   # DC DPCM resets at each chroma plane boundary
+                for blk_idx in range(n_chr_blocks):
+                    bx = blk_idx % chr_blk_cols
+                    by = blk_idx // chr_blk_cols
+                    px = bx * 8
+                    py = by * 8
+                    _ = bs.read_bits(2)   # 2-bit mode, always 0 (INTRA_DC)
+                    resid, prev_dc = decode_residual(bs, step, prev_dc)
+                    for r in range(8):
+                        for c in range(8):
+                            plane_buf[py + r][px + c] = max(0, min(255,
+                                resid[r][c] + 128))
+
         # Update reference frame with reconstructed luma
         for r in range(H):
             for c in range(W):
                 ref_frame[r * W + c] = Y[r][c]
 
-        output_frames.append(Y)
+        # Debug: print Cb range
+        all_cb = [v for row in Cb for v in row]
+        print(f"  Cb range: min={min(all_cb)} max={max(all_cb)} mean={sum(all_cb)//len(all_cb)}")
+        all_cr = [v for row in Cr for v in row]
+        print(f"  Cr range: min={min(all_cr)} max={max(all_cr)} mean={sum(all_cr)//len(all_cr)}")
+
+        output_frames.append((Y, Cb, Cr))
 
         # Stop if we've consumed the entire bitstream
         if bs.byte_pos >= len(raw) and bs.bit_count == 0:
@@ -424,16 +457,13 @@ def main():
 
     # Write YUV420p planar (all frames)
     with open(yuv_path, 'wb') as f:
-        for Y in output_frames:
-            # Y plane
+        for Y, Cb, Cr in output_frames:
             for row in Y:
                 f.write(bytes(row))
-            # Cb/Cr planes (128 = grey, encoder is luma-only)
-            chroma_row = bytes([128] * (W // 2))
-            for _ in range(H // 2):
-                f.write(chroma_row)
-            for _ in range(H // 2):
-                f.write(chroma_row)
+            for row in Cb:
+                f.write(bytes(row))
+            for row in Cr:
+                f.write(bytes(row))
 
     n_frames  = len(output_frames)
     yuv_bytes = n_frames * (W * H + 2 * (W // 2) * (H // 2))

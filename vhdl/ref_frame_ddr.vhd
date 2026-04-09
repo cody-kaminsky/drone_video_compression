@@ -64,7 +64,7 @@ entity ref_frame_ddr is
     wr_start     : in  std_logic;                       -- pulse: new block start
     wr_blk_x     : in  unsigned(11 downto 0);           -- pixel x of block top-left
     wr_blk_y     : in  unsigned(11 downto 0);           -- pixel y of block top-left
-    wr_pixel     : in  std_logic_vector(7 downto 0);    -- one pixel per clock
+    wr_pixel     : in  std_logic_vector(63 downto 0);   -- 8 pixels (one row) per clock
     wr_pixel_v   : in  std_logic;                       -- pixel valid
     wr_done      : out std_logic;                       -- all 64 pixels accepted
 
@@ -128,7 +128,8 @@ architecture rtl of ref_frame_ddr is
   -- ---------------------------------------------------------------------------
   -- Constants
   -- ---------------------------------------------------------------------------
-  constant BRAM_COLS   : integer := MAX_WIDTH / 8;  -- 480 words per row at 4K
+  constant BRAM_COLS   : integer := 512;  -- rounded up to power-of-2 for BRAM-friendly addressing
+                                         -- (4K uses 480 of 512 words per row)
 
   -- ---------------------------------------------------------------------------
   -- BRAM: 40 rows x 480 words x 64-bit
@@ -142,7 +143,7 @@ architecture rtl of ref_frame_ddr is
   attribute ram_style       : string;
   attribute ram_style of bram : signal is "block";
 
-  -- Port A (write) — two sources muxed in the BRAM write process
+  -- Port A (write) — two sources, combined via combinatorial mux before BRAM process
   -- Pixel-write path (reconstructed pixels from recon_writer)
   signal wr_bram_en   : std_logic := '0';
   signal wr_bram_addr : integer range 0 to BRAM_DEPTH-1 := 0;
@@ -151,21 +152,22 @@ architecture rtl of ref_frame_ddr is
   signal pf_bram_en   : std_logic := '0';
   signal pf_bram_addr : integer range 0 to BRAM_DEPTH-1 := 0;
   signal pf_bram_din  : std_logic_vector(63 downto 0);
+  -- Consolidated single write source (pixel-write has priority)
+  signal bram_a_en   : std_logic;
+  signal bram_a_addr : integer range 0 to BRAM_DEPTH-1;
+  signal bram_a_din  : std_logic_vector(63 downto 0);
 
   -- Port B (read) — registered output (1-cycle latency)
   signal bram_b_addr : integer range 0 to BRAM_DEPTH-1 := 0;
   signal bram_b_dout : std_logic_vector(63 downto 0);
 
   -- ---------------------------------------------------------------------------
-  -- Write pixel buffer: collect 8 pixels into one 64-bit BRAM word
+  -- Write pixel buffer: accepts 64-bit rows (8 pixels each) directly
   -- ---------------------------------------------------------------------------
-  signal wr_phase     : integer range 0 to 7 := 0;
-  signal wr_word      : std_logic_vector(63 downto 0) := (others => '0');
   signal wr_px        : unsigned(11 downto 0) := (others => '0');
   signal wr_py        : unsigned(11 downto 0) := (others => '0');
   signal wr_row       : integer range 0 to 7 := 0;  -- row within 8x8 block
   signal wr_col_word  : integer range 0 to BRAM_COLS-1 := 0;
-  signal wr_cnt       : integer range 0 to 64 := 0;
   signal wr_done_r    : std_logic := '0';
 
   -- AXI write FSM for reconstructed pixels → DDR
@@ -218,26 +220,27 @@ architecture rtl of ref_frame_ddr is
 begin
 
   -- ---------------------------------------------------------------------------
-  -- BRAM port A: synchronous write (both prefetch and wr_pixel_buf write here)
+  -- BRAM port A: consolidated single write source (allows BRAM inference)
+  -- Pixel-write has priority; prefetch uses remaining cycles.
+  -- Mux is combinatorial so Vivado sees a single write-enable + address.
   -- ---------------------------------------------------------------------------
-  -- BRAM port A write: pixel-write has priority; prefetch uses remaining cycles
-  -- ---------------------------------------------------------------------------
+  bram_a_en   <= wr_bram_en or pf_bram_en;
+  bram_a_addr <= wr_bram_addr when wr_bram_en = '1' else pf_bram_addr;
+  bram_a_din  <= wr_bram_din  when wr_bram_en = '1' else pf_bram_din;
+
   process(aclk)
   begin
     if rising_edge(aclk) then
-      if wr_bram_en = '1' then
-        bram(wr_bram_addr) <= wr_bram_din;
-      elsif pf_bram_en = '1' then
-        bram(pf_bram_addr) <= pf_bram_din;
+      if bram_a_en = '1' then
+        bram(bram_a_addr) <= bram_a_din;
       end if;
     end if;
   end process;
 
-  -- BRAM port B: combinatorial address decode + registered data output (1-cycle latency).
-  -- The previous version registered the address AND the data, giving 2-cycle latency
-  -- which broke me_engine and halfpel_mc (both assume 1-cycle).
-  bram_b_addr <= to_integer(unsigned(rd_addr(14 downto 9))) * BRAM_COLS
-               + to_integer(unsigned(rd_addr(8 downto 0)));
+  -- BRAM port B: registered data output (1-cycle latency).
+  -- With BRAM_COLS=512, rd_addr = {row[5:0], col[8:0]} maps directly to
+  -- a linear index (row*512+col) — no multiply needed, clean for inference.
+  bram_b_addr <= to_integer(unsigned(rd_addr));
 
   process(aclk)
   begin
@@ -253,57 +256,42 @@ begin
   wr_done <= wr_done_r;
 
   process(aclk)
-    variable stride_words : unsigned(11 downto 0);
   begin
     if rising_edge(aclk) then
       if aresetn = '0' then
-        wr_phase   <= 0;
-        wr_cnt     <= 0;
         wr_done_r  <= '0';
         wr_row_rdy <= '0';
         wr_bram_en <= '0';
+        wr_row     <= 0;
       else
         wr_done_r  <= '0';
         wr_row_rdy <= '0';
         wr_bram_en <= '0';
 
         if wr_start = '1' then
-          wr_px    <= wr_blk_x;
-          wr_py    <= wr_blk_y;
-          wr_phase <= 0;
-          wr_row   <= 0;
-          wr_cnt   <= 0;
+          wr_px       <= wr_blk_x;
+          wr_py       <= wr_blk_y;
+          wr_row      <= 0;
           wr_col_word <= to_integer(wr_blk_x(11 downto 3));
         end if;
 
-        if wr_pixel_v = '1' and wr_cnt < 64 then
-          -- Pack pixel into current 64-bit word (byte 0 = leftmost)
-          wr_word(wr_phase*8+7 downto wr_phase*8) <= wr_pixel;
+        -- Each wr_pixel_v pulse delivers one full row (64-bit = 8 pixels)
+        if wr_pixel_v = '1' then
+          wr_bram_en   <= '1';
+          wr_bram_addr <= bram_addr(to_integer(wr_py) + wr_row, wr_col_word);
+          wr_bram_din  <= wr_pixel;
 
-          if wr_phase = 7 then
-            -- Complete word: write to BRAM at reconstructed position
-            wr_bram_en   <= '1';
-            wr_bram_addr <= bram_addr(to_integer(wr_py) + wr_row, wr_col_word);
-            wr_bram_din  <= wr_word(55 downto 0) & wr_pixel;  -- include last pixel
+          wr_row_buf(wr_row) <= wr_pixel;
 
-            -- Queue this word for DDR write as well
-            wr_row_buf(wr_row) <= wr_word(55 downto 0) & wr_pixel;
-
-            wr_phase <= 0;
-            if wr_row = 7 then
-              wr_row     <= 0;
-              wr_done_r  <= '1';
-              wr_row_rdy <= '1';
-              wr_axi_px  <= wr_px;
-              wr_axi_py  <= wr_py;
-            else
-              wr_row <= wr_row + 1;
-            end if;
+          if wr_row = 7 then
+            wr_row     <= 0;
+            wr_done_r  <= '1';
+            wr_row_rdy <= '1';
+            wr_axi_px  <= wr_px;
+            wr_axi_py  <= wr_py;
           else
-            wr_word(wr_phase*8+7 downto wr_phase*8) <= wr_pixel;
-            wr_phase <= wr_phase + 1;
+            wr_row <= wr_row + 1;
           end if;
-          wr_cnt <= wr_cnt + 1;
         end if;
       end if;
     end if;

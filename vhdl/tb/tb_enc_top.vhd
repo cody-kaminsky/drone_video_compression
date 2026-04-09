@@ -45,8 +45,8 @@ use work.enc_pkg.all;
 
 entity tb_enc_top is
   generic (
-    FRAME_W  : integer := 64;          -- must be multiple of 8
-    FRAME_H  : integer := 48;          -- must be multiple of 8
+    FRAME_W  : integer := 1024;         -- must be multiple of 8
+    FRAME_H  : integer := 768;         -- must be multiple of 8
     G_QP     : integer := 28;          -- quantisation parameter
     G_GOP    : integer := 1;           -- 1 = all I-frames
     YUV_FILE : string  := "";          -- raw YUV 4:2:0 file; "" = synthetic
@@ -195,7 +195,12 @@ architecture sim of tb_enc_top is
   end procedure;
 
   -- -------------------------------------------------------------------------
-  -- Send one byte on the video AXI-Stream
+  -- Send one byte on the video AXI-Stream at 1 cycle/pixel (streaming).
+  -- Data is presented immediately; the procedure waits for a full settled
+  -- clock edge before reading tready, avoiding the delta-cycle race against
+  -- mb_buffer's combinatorial s_tready.  tvalid is left asserted on exit
+  -- so consecutive calls have zero idle gap.
+  -- Caller must de-assert vid_tvalid after the final pixel.
   -- -------------------------------------------------------------------------
   procedure send_vid_byte (
     signal   clk    : in  std_logic;
@@ -209,16 +214,14 @@ architecture sim of tb_enc_top is
     constant user   : in  std_logic
   ) is
   begin
-    -- Wait until downstream is ready
-    wait until rising_edge(clk) and tready = '1';
     tdata  <= std_logic_vector(to_unsigned(val mod 256, 8));
     tvalid <= '1';
     tlast  <= last;
     tuser  <= user;
-    wait until rising_edge(clk);
-    tvalid <= '0';
-    tlast  <= '0';
-    tuser  <= '0';
+    wait until rising_edge(clk);        -- always wait at least one full cycle
+    while tready /= '1' loop            -- hold data until accepted
+      wait until rising_edge(clk);
+    end loop;
   end procedure;
 
 begin
@@ -468,7 +471,7 @@ begin
                     vid_tready, pix, v_last, v_user);
     end loop;
 
-    -- --- Cb plane (W/2 × H/2) ---
+    -- --- Cb plane (W/2 × H/2): horizontal colour ramp ---
     total  := (FRAME_W / 2) * (FRAME_H / 2);
     line_w := FRAME_W / 2;
     for i in 0 to total - 1 loop
@@ -476,25 +479,31 @@ begin
         read(yuv_f, c);
         pix := character'pos(c);
       else
-        pix := 128;
+        -- Horizontal ramp: 100..227 across each chroma row (exercises AC coeffs)
+        pix := 100 + (i mod line_w) * 127 / (line_w - 1);
       end if;
       if (i mod line_w) = line_w - 1 then v_last := '1'; else v_last := '0'; end if;
       send_vid_byte(aclk, vid_tdata, vid_tvalid, vid_tlast, vid_tuser,
                     vid_tready, pix, v_last, '0');
     end loop;
 
-    -- --- Cr plane (W/2 × H/2) ---
+    -- --- Cr plane (W/2 × H/2): diagonal colour pattern ---
     for i in 0 to total - 1 loop
       if use_file and not endfile(yuv_f) then
         read(yuv_f, c);
         pix := character'pos(c);
       else
-        pix := 128;
+        -- Diagonal ramp: exercises both row-AC and col-AC in chroma DCT
+        pix := 80 + ((i / line_w) * 3 + (i mod line_w) * 5) mod 121;
       end if;
       if (i mod line_w) = line_w - 1 then v_last := '1'; else v_last := '0'; end if;
       send_vid_byte(aclk, vid_tdata, vid_tvalid, vid_tlast, vid_tuser,
                     vid_tready, pix, v_last, '0');
     end loop;
+
+    -- De-assert tvalid after last pixel (streaming procedure leaves it high)
+    vid_tvalid <= '0';
+    vid_tlast  <= '0';
 
     if use_file then
       file_close(yuv_f);
@@ -581,9 +590,9 @@ begin
   -- -------------------------------------------------------------------------
   process
   begin
-    wait for 5 ms;
+    wait for 30 ms;  -- extended: chroma adds ~50% more blocks (3 planes)
     if not sim_done then
-      report "SIMULATION FAIL: watchdog timeout after 5 ms" severity failure;
+      report "SIMULATION FAIL: watchdog timeout after 30 ms" severity failure;
     end if;
     wait;
   end process;

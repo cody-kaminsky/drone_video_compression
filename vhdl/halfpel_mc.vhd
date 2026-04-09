@@ -110,21 +110,22 @@ architecture rtl of halfpel_mc is
   function bilerp(a00, a01, a10, a11 : std_logic_vector(7 downto 0);
                   xhalf, yhalf : std_logic) return std_logic_vector is
     variable v00, v01, v10, v11 : unsigned(7 downto 0);
-    variable sum10              : unsigned(9 downto 0);
+    variable sum2               : unsigned(8 downto 0);   -- 2x 8-bit + 1 = max 511
+    variable sum4               : unsigned(9 downto 0);   -- 4x 8-bit + 2 = max 1022
   begin
     v00 := unsigned(a00);  v01 := unsigned(a01);
     v10 := unsigned(a10);  v11 := unsigned(a11);
     if xhalf = '0' and yhalf = '0' then
       return a00;
     elsif xhalf = '1' and yhalf = '0' then
-      sum10 := ('0' & v00) + ('0' & v01) + 1;
-      return std_logic_vector(sum10(8 downto 1));
+      sum2 := ('0' & v00) + ('0' & v01) + 1;
+      return std_logic_vector(sum2(8 downto 1));
     elsif xhalf = '0' and yhalf = '1' then
-      sum10 := ('0' & v00) + ('0' & v10) + 1;
-      return std_logic_vector(sum10(8 downto 1));
+      sum2 := ('0' & v00) + ('0' & v10) + 1;
+      return std_logic_vector(sum2(8 downto 1));
     else
-      sum10 := ('0' & v00) + ('0' & v01) + ('0' & v10) + ('0' & v11) + 2;
-      return std_logic_vector(sum10(9 downto 2));
+      sum4 := ("00" & v00) + ("00" & v01) + ("00" & v10) + ("00" & v11) + 2;
+      return std_logic_vector(sum4(9 downto 2));
     end if;
   end function;
 
