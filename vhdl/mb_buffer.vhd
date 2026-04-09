@@ -622,6 +622,7 @@ begin
                   -- WAIT_RECON.  Row 0 data arrives on PREFETCH cycle 0 (saves 1 cy).
                   rd_waddr     <= rd_waddr + 1;
                   rd_fetch_row <= 0;
+                  fetch_cnt    <= 0;  -- reset for early-prefetch loop in WAIT_RECON
                 end if;
                 fsm <= WAIT_RECON;
               else
@@ -633,6 +634,23 @@ begin
             if m_tready = '1' then
               m_tvalid_r <= '0';
             end if;
+            -- Early PREFETCH overlap for VERT / DC modes (no left_col dependency).
+            -- rd_waddr and rd_fetch_row were pre-set in EMIT; fetch_cnt starts at 0.
+            -- We run the same capture loop as PREFETCH so that by the time
+            -- recon_done fires, some (or all) of the 8 rows are already loaded.
+            if intra_mode_r /= INTRA_HORIZ and last_blk_done = '0' then
+              if fetch_cnt < 8 then
+                if fetch_cnt > 0 then
+                  row_regs(fetch_cnt - 1) <= rd_data;
+                end if;
+                if fetch_cnt < 7 then
+                  rd_fetch_row <= fetch_cnt + 1;
+                end if;
+                fetch_cnt <= fetch_cnt + 1;
+              elsif fetch_cnt = 8 then
+                row_regs(7) <= rd_data;  -- hold last-row capture stable
+              end if;
+            end if;
             if recon_done = '1' then
               above_row_store(rd_blk) <= recon_row7;
               left_col_pix            <= recon_col7;
@@ -641,13 +659,17 @@ begin
                 strip_y_r   <= strip_y_r + 8;
                 fsm         <= IDLE;
               else
-                -- rd_waddr was already incremented in EMIT (non-last block).
-                -- Row 0 BRAM read has been in flight throughout WAIT_RECON;
-                -- its data arrives on the first PREFETCH cycle.
-                rd_blk       <= rd_blk + 1;
-                rd_fetch_row <= 1;    -- pre-issue row 1; row 0 data arrives next
-                fetch_cnt    <= 1;    -- PREFETCH begins by capturing row 0
-                fsm          <= PREFETCH;
+                rd_blk <= rd_blk + 1;
+                if intra_mode_r /= INTRA_HORIZ then
+                  -- VERT/DC: early prefetch was running; continue from
+                  -- current fetch_cnt (rd_waddr & rd_fetch_row already set).
+                  fsm <= PREFETCH;
+                else
+                  -- HORIZ: only the Step-2 single-cycle optimisation applies.
+                  rd_fetch_row <= 1;
+                  fetch_cnt    <= 1;
+                  fsm          <= PREFETCH;
+                end if;
               end if;
             end if;
 
