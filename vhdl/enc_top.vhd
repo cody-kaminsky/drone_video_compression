@@ -853,18 +853,19 @@ begin
           eg_last_latch  <= '1';  -- no previous block to wait for
         end if;
 
-        -- Latch zz_eg_tlast: set when the last zigzag token for a block is
-        -- consumed by exp-golomb.  Provides a definitive "block done" marker
-        -- that cannot false-trigger mid-block (unlike bare eg_cw_valid='0').
-        if zz_eg_tvalid = '1' and zz_eg_tlast = '1' and zz_eg_tready = '1' then
-          eg_last_latch <= '1';
+        -- Track zigzag stream boundaries: eg_last_latch follows zz_eg_tlast
+        -- so it is '1' between blocks (after the last token) and '0' during
+        -- a block (after the first non-last token).  This prevents the mode
+        -- header from firing mid-block when eg_cw_valid briefly goes '0'
+        -- between tokens, without creating a cross-block stall.
+        if zz_eg_tvalid = '1' and zz_eg_tready = '1' then
+          eg_last_latch <= zz_eg_tlast;
         end if;
 
         -- I-frame block mode header: inject 2-bit intra mode before ue(count).
-        -- The latch ensures we wait for the previous block's zigzag stream to
-        -- fully enter exp-golomb; eg_cw_valid='0' confirms the last codeword
-        -- has been accepted by bs_packer.  Together they give deterministic,
-        -- race-free timing (eliminates the 0-2 cy jitter of the old poll).
+        -- eg_last_latch='1' guarantees we are between blocks (previous block's
+        -- zigzag stream is complete); eg_cw_valid='0' confirms the last
+        -- codeword has been accepted by bs_packer.
         if mode_hdr_pend = '1' and ftype_hdr_pend = '0'
            and eg_cw_valid = '0' and eg_last_latch = '1' then
           hdr_active    <= '1';
@@ -872,7 +873,6 @@ begin
           hdr_cw_len    <= to_unsigned(2, 6);
           hdr_cw_valid  <= '1';
           mode_hdr_pend <= '0';
-          eg_last_latch <= '0';
         end if;
 
         -- ---------------------------------------------------------------
