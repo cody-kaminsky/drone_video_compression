@@ -298,6 +298,10 @@ architecture rtl of enc_top is
   -- Count skip blocks (they don't produce zigzag tlast)
   signal skip_block_cnt : integer range 0 to 32767 := 0;
 
+  -- Registered latch: captures zz_eg_tlast to give deterministic completion
+  -- detection for mode-header injection (replaces eg_cw_valid polling).
+  signal eg_last_latch  : std_logic := '0';
+
   -- -------------------------------------------------------------------------
   -- P-frame residual emission to DCT
   -- -------------------------------------------------------------------------
@@ -819,6 +823,7 @@ begin
         mv_x_pend      <= '0';
         mv_y_pend      <= '0';
         mode_hdr_pend  <= '0';
+        eg_last_latch  <= '0';
         rw_blk_start   <= '0';
         emit_row_idx   <= 0;
         cap_row        <= 0;
@@ -845,19 +850,29 @@ begin
         if frame_start = '1' then
           ftype_hdr_pend <= '1';
           mode_hdr_pend  <= '0';  -- reset at new frame
+          eg_last_latch  <= '0';
         end if;
 
-        -- I-frame block mode header: inject 2-bit intra mode before ue(count)
-        -- Gate on eg_cw_valid='0': previous block's exp-Golomb output must be
-        -- drained before injecting the header, otherwise the header fires mid-
-        -- stream while the previous block's zigzag is still emitting (possible
-        -- now that recon_done fires in ~46 cycles instead of ~156).
-        if mode_hdr_pend = '1' and ftype_hdr_pend = '0' and eg_cw_valid = '0' then
+        -- Latch zz_eg_tlast: set when the last zigzag token for a block is
+        -- consumed by exp-golomb.  Provides a definitive "block done" marker
+        -- that cannot false-trigger mid-block (unlike bare eg_cw_valid='0').
+        if zz_eg_tvalid = '1' and zz_eg_tlast = '1' and zz_eg_tready = '1' then
+          eg_last_latch <= '1';
+        end if;
+
+        -- I-frame block mode header: inject 2-bit intra mode before ue(count).
+        -- The latch ensures we wait for the previous block's zigzag stream to
+        -- fully enter exp-golomb; eg_cw_valid='0' confirms the last codeword
+        -- has been accepted by bs_packer.  Together they give deterministic,
+        -- race-free timing (eliminates the 0-2 cy jitter of the old poll).
+        if mode_hdr_pend = '1' and ftype_hdr_pend = '0'
+           and eg_cw_valid = '0' and eg_last_latch = '1' then
           hdr_active    <= '1';
           hdr_cw_data   <= mode_hdr_val & (29 downto 0 => '0');
           hdr_cw_len    <= to_unsigned(2, 6);
           hdr_cw_valid  <= '1';
           mode_hdr_pend <= '0';
+          eg_last_latch <= '0';
         end if;
 
         -- ---------------------------------------------------------------
